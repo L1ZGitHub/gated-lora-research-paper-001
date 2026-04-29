@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Model artifacts (NEVER commit — pushed to HF Hub instead)
+outputs/
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# Optimizer state (transient, used only for SLURM resume)
+optimizer.pt
+
+# Wandb
+wandb/
+.wandb/
+
+# Logs
+logs/
+*.log
+*.out
+*.err
+
+# Local data caches
+data/cache/
+.cache/
+~/.cache/huggingface/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.token
+*_secret*
+
+# Lock files (uv handles these)
+# uv.lock IS committed
