@@ -6,13 +6,23 @@ config-driven pipeline.
 
 ## Status
 
-> **Work in progress.** Repo scaffolded 2026-04-30 from 11 fragmented
+> **Refactor complete.** Repo scaffolded 2026-04-30 from 11 fragmented
 > `ensicompute_*` folders. See [`experiments/legacy/merge_notes.md`](experiments/legacy/merge_notes.md)
 > for the refactor plan and provenance of each module.
 
-Phases A–I complete: scaffold, stable code, unified `LoRAExpert` /
-`GatedLoRAModelV2` / `GatedLoRATrainer`, YAML-driven configs, SLURM chain
-templates, CLI entrypoint, and 36 passing smoke tests.
+Phases A–L complete:
+- Scaffold + uv-managed deps
+- Stable code import (~2400 LoC identical across all variants)
+- Unified `LoRAExpert` (Phi-2 + GQA + GPT-NeoX)
+- Unified `GatedLoRAModelV2` (multi-architecture)
+- Unified `GatedLoRATrainer` (SLURM chaining + optional routing analysis)
+- Multi-task dataset (8 tasks, 5 presets)
+- YAML configs (7 models × 5 tasks × 3 ablations)
+- SLURM chain templates (turing-[4-9], 4h-aware)
+- CLI entrypoint + end-to-end pipeline
+- 36 passing smoke tests
+- Transfer pipeline (Ensimag → HF Hub, automated)
+- Claude Code CLI supervisor (Opus 4.7 on VPS, autonomous)
 
 ## Supported models
 
