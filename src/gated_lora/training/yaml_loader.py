@@ -35,10 +35,25 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 
 def _resolve_path(ref: str | Path) -> Path:
-    """Resolve a config reference to an absolute path under configs/."""
+    """Resolve a config reference to an absolute path.
+
+    Accepts:
+      - absolute paths,
+      - paths relative to repo root (e.g. ``configs/models/phi2.yaml``),
+      - paths relative to configs/ (e.g. ``models/phi2.yaml``, used inside ``extends:``).
+    """
     p = Path(ref)
     if p.is_absolute():
         return p
+
+    if p.exists():
+        return p.resolve()
+
+    repo_root = CONFIGS_ROOT.parent
+    candidate = (repo_root / p).resolve()
+    if candidate.exists():
+        return candidate
+
     return (CONFIGS_ROOT / p).resolve()
 
 
