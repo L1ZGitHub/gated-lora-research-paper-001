@@ -126,6 +126,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Resolve config + print it; do not start training.",
     )
+    p.add_argument(
+        "--analyze-routing",
+        action="store_true",
+        help="Run post-training routing analysis (gated models only).",
+    )
     return p.parse_args()
 
 
@@ -157,11 +162,10 @@ def main() -> int:
         logger.info("--dry-run: stopping before training.")
         return 0
 
-    # Phase I will wire up model/dataset/trainer instantiation here.
-    raise NotImplementedError(
-        "Training pipeline wiring (model + dataset + trainer instantiation) "
-        "is scheduled for Phase I. Use --dry-run to validate config loading."
-    )
+    from gated_lora.training.pipeline import run_experiment
+
+    run_experiment(config, analyze_routing=args.analyze_routing)
+    return 0
 
 
 if __name__ == "__main__":

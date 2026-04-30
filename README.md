@@ -6,8 +6,13 @@ config-driven pipeline.
 
 ## Status
 
-> **Work in progress.** Repo scaffolded on 2026-04-30. See `MERGE_NOTES.md` (in legacy repo)
+> **Work in progress.** Repo scaffolded 2026-04-30 from 11 fragmented
+> `ensicompute_*` folders. See [`experiments/legacy/merge_notes.md`](experiments/legacy/merge_notes.md)
 > for the refactor plan and provenance of each module.
+
+Phases A–I complete: scaffold, stable code, unified `LoRAExpert` /
+`GatedLoRAModelV2` / `GatedLoRATrainer`, YAML-driven configs, SLURM chain
+templates, CLI entrypoint, and 36 passing smoke tests.
 
 ## Supported models
 
@@ -47,13 +52,28 @@ tests/                  # Smoke tests
 
 ```bash
 # Setup (one-time)
-uv sync
+uv sync --extra dev
 
-# Run a single experiment
-uv run python -m gated_lora.cli --config configs/experiments/phi2_harder_multitask.yaml --seed 42
+# Validate a config without launching training
+uv run python -m gated_lora.cli \
+    --config configs/experiments/phi2_harder_multitask.yaml \
+    --seed 42 --dry-run
 
-# Submit to SLURM (4h slot, auto-chains until EXPERIMENT_DONE)
-sbatch scripts/slurm/train.sbatch --config configs/experiments/phi2_harder_multitask.yaml --seed 42 --partition rtx6000
+# Run a single training (locally, requires GPU)
+uv run python -m gated_lora.cli \
+    --config configs/experiments/phi2_harder_multitask.yaml \
+    --seed 42
+
+# Run on Ensimag SLURM with auto-chaining (handles 4h time limit)
+bash scripts/slurm/chain_jobs.sh \
+    --config configs/experiments/phi2_harder_multitask.yaml \
+    --seed 42 --partition rtx6000
+
+# Multi-seed launch (3 seeds × auto-chain each)
+./scripts/launch_experiment.sh configs/experiments/phi2_harder_multitask.yaml
+
+# Run tests
+uv run pytest tests/ -v
 ```
 
 ## Storage / SLURM constraints
