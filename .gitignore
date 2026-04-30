@@ -60,6 +60,7 @@ htmlcov/
 !.env.example
 *.token
 *_secret*
+*.ovpn         # VPN configs (keep on disk only, not in git)
 
 # Lock files (uv handles these)
 # uv.lock IS committed

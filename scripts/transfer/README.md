@@ -1,75 +1,79 @@
-# Transfer pipeline (Ensimag → VPS → Hugging Face Hub)
+# Transfer pipeline (Ensimag → Hugging Face Hub, direct)
 
-Keeps Ensimag under the 10 GB quota by streaming completed runs to the HF Hub
-private dataset `Helain/gated-lora-experiments`.
+Keeps Ensimag under the 10 GB quota by pushing completed checkpoints to the
+HF Hub private dataset `Helain/gated-lora-experiments` and deleting the
+local copies as soon as the upload succeeds.
+
+> **Note on architecture**: the OVH VPS **cannot reach Ensimag** through
+> the school firewall (port 22 timeout). The push therefore runs **on
+> the Ensimag login node**, not on the VPS.
+> The `cron_check.sh` / `sync_run_to_hf.py` scripts (VPS-side, kept here
+> for completeness) are unused by the production pipeline — they remain
+> in case the school VPN is later configured on the VPS.
 
 ## Files
 
 | Script | Where it runs | Purpose |
 |--------|----|----|
-| `sync_run_to_hf.py` | VPS (or any machine with SSH access to Ensimag) | rsync + HF upload + optional remote cleanup |
-| `cron_check.sh` | VPS, every 5 min via cron | Scan for `TRAINING_DONE` markers, trigger `sync_run_to_hf.py` for new ones |
+| **`ensimag_push.py`** | **Ensimag login node** | Scan `outputs/*/checkpoint-*/`, push non-LATEST checkpoints to HF, delete locally. On `TRAINING_DONE`, push root files and clean the run dir. Idempotent via `.uploaded` state file. |
+| **`ensimag_cron.sh`** | **Ensimag login node**, every 5 min | Bash wrapper for cron registration. Loads `HF_TOKEN` from `.env`. |
+| `sync_run_to_hf.py` (legacy) | VPS, requires VPN | rsync from Ensimag + upload (unused without VPN) |
+| `cron_check.sh` (legacy) | VPS, requires VPN | Triggers `sync_run_to_hf.py` (unused without VPN) |
 
 ## How it works
 
-1. SLURM job finishes a training run → trainer writes `TRAINING_DONE` marker.
-2. `cron_check.sh` runs every 5 min on the VPS, lists Ensimag for new markers
-   via a single SSH connection.
-3. For each new run found, invokes `sync_run_to_hf.py`:
-   - `rsync` from Ensimag to a temp staging dir (excludes `optimizer.pt`,
-     `__pycache__`, and `checkpoint-LATEST/` if `--keep-latest`).
-   - `huggingface_hub.upload_folder()` to `Helain/gated-lora-experiments`
-     under `<run_name>/`.
-   - With `--cleanup`: deletes synced files from Ensimag (keeps
-     `TRAINING_DONE` so the orchestrator knows the run is finished).
-4. State file (`~/.cache/gated-lora-synced.txt`) tracks already-synced runs
-   so they're not re-uploaded on every tick.
+1. Trainer saves a checkpoint (every `save_steps`) → directory
+   `outputs/<run>/checkpoint-N/` with `expert_pools.pt`, etc. The trainer
+   rotates `optimizer.pt` so only `checkpoint-LATEST/` keeps it.
+2. `ensimag_cron.sh` (Ensimag login node, every 5 min) calls `ensimag_push.py`:
+   - For each run dir, finds `checkpoint-N/` directories that are NOT
+     `checkpoint-LATEST/` and not already in `.uploaded`.
+   - Uploads each to HF Hub under `<run>/<checkpoint-N>/`
+     (excludes `optimizer.pt`).
+   - Deletes the local checkpoint directory.
+   - Records the upload in the run's `.uploaded` file (idempotent).
+3. When `TRAINING_DONE` appears, the next cron tick:
+   - Uploads root-level files (`final_results.json`, `routing_history.json`,
+     `experiment_config.json`, figures).
+   - Deletes everything in the run dir except `TRAINING_DONE`
+     (the marker stays so `chain_jobs.sh` knows to stop resubmitting).
 
-## VPS setup (one-time)
+## Ensimag setup (one-time, on the login node)
 
 ```bash
 # 1. Clone repo
+cd ~/GatedLoraProject
 git clone git@github.com:L1ZGitHub/gated-lora-research-paper-001.git
 cd gated-lora-research-paper-001
 
-# 2. Install deps (just huggingface_hub, no torch needed)
-python3 -m venv .venv
-source .venv/bin/activate
-pip install huggingface_hub pyyaml
+# 2. Install Python deps via uv (already installed in pyproject.toml — uv sync handles it)
+uv sync --no-dev
 
-# 3. Set HF_TOKEN
+# 3. Set HF_TOKEN (also used by the trainer for downloading gated models like Llama/Gemma)
 echo 'HF_TOKEN=hf_xxx_your_write_token' > .env
 chmod 600 .env
 
-# 4. Set up SSH access to Ensimag (must work non-interactively!)
-#    Test: ssh ensimag 'echo OK'
+# 4. Smoke-test (dry-run)
+.venv/bin/python scripts/transfer/ensimag_push.py \
+    --outputs-dir ./outputs \
+    --dry-run --verbose
 
-# 5. Smoke-test the sync (dry-run)
-python3 scripts/transfer/sync_run_to_hf.py \
-    --remote-host ensimag \
-    --remote-output-dir /tmp/fake_run_for_test \
-    --hf-repo Helain/gated-lora-experiments \
-    --hf-path test \
-    --dry-run
-
-# 6. Add cron entry
+# 5. Add cron entry on the Ensimag login node
 ( crontab -l 2>/dev/null; \
-  echo "*/5 * * * * /home/debian/gated-lora-research-paper-001/scripts/transfer/cron_check.sh >> /var/log/glr-sync.log 2>&1" ) \
+  echo "*/5 * * * * /user/2/zimmermh/GatedLoraProject/gated-lora-research-paper-001/scripts/transfer/ensimag_cron.sh >> ~/glr-push.log 2>&1" ) \
   | crontab -
 ```
 
 ## Tunables (env vars)
 
-- `GLR_REMOTE_HOST` (default `ensimag`) — SSH alias
-- `GLR_REMOTE_OUTPUTS` — base path on Ensimag holding `outputs/<run>/` subdirs
-- `GLR_HF_REPO` (default `Helain/gated-lora-experiments`) — HF dataset repo
-- `GLR_ENV_FILE` — path to .env with HF_TOKEN
-- `GLR_STATE_FILE` — path to "already synced" tracker
+- `GLR_OUTPUTS_DIR` — outputs/ root (default: `<repo>/outputs`)
+- `GLR_HF_REPO` (default `Helain/gated-lora-experiments`)
+- `GLR_ENV_FILE` — path to `.env` (default: repo root)
 
 ## Storage math (with this pipeline)
 
 Per active run:
-- LATEST checkpoint (kept on Ensimag for resume) = ~74 MB (expert_pools.pt) + 85–240 MB (optimizer.pt, rotated) ≈ **160–315 MB**
-- Older checkpoints synced + deleted as soon as TRAINING_DONE → **0 MB after sync**
+- `checkpoint-LATEST/` (kept locally for resume) = ~74 MB (expert_pools.pt) + 85–240 MB (optimizer.pt) ≈ **160–315 MB**
+- Older checkpoints uploaded + deleted within 5 min → **~0 MB extra**
 
-With 6 concurrent runs: **~1–2 GB on Ensimag** at peak. Well below the 10 GB cap.
+With 6 concurrent runs at peak: **~1–2 GB on Ensimag**. Well below 10 GB cap.

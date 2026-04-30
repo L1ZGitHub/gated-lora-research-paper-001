@@ -1,62 +1,93 @@
 #!/bin/bash
-# Collect current state of experiments from Ensimag.
-# Single SSH connection (Ensimag is rate-limit-sensitive).
-# Output: JSON-ish report on stdout that the supervisor LLM will read.
+# Collect state for the supervisor by reading the HF Hub dataset
+# (the OVH VPS cannot reach Ensimag through the school firewall).
+# Output is plain text on stdout, designed to be fed to the LLM supervisor.
 
 set -euo pipefail
 
-REMOTE_HOST="${GLR_REMOTE_HOST:-ensimag}"
-REMOTE_OUTPUTS="${GLR_REMOTE_OUTPUTS:-/user/2/zimmermh/GatedLoraProject/gated-lora-research-paper-001/outputs}"
-REMOTE_LOGS="${GLR_REMOTE_LOGS:-/user/2/zimmermh/GatedLoraProject/gated-lora-research-paper-001/logs}"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ENV_FILE="${GLR_ENV_FILE:-${PROJECT_ROOT}/.env}"
+HF_REPO="${GLR_HF_REPO:-Helain/gated-lora-experiments}"
 
-ssh -o ConnectTimeout=10 "$REMOTE_HOST" bash <<EOF
-set -euo pipefail
+if [[ -f "$ENV_FILE" ]]; then
+    set -a; source "$ENV_FILE"; set +a
+fi
+
+if [[ -z "${HF_TOKEN:-}" ]]; then
+    echo "ERROR: HF_TOKEN not set"
+    exit 1
+fi
+
+# Resolve python interpreter — prefer the VPS venv if present
+if [[ -d "${PROJECT_ROOT}/.venv" ]]; then
+    PY="${PROJECT_ROOT}/.venv/bin/python"
+else
+    PY="python3"
+fi
 
 echo "=== TIMESTAMP ==="
 date -Iseconds
 
 echo ""
-echo "=== DISK USAGE (\$HOME) ==="
-df -h "\$HOME" | head -2
+echo "=== HF DATASET STATE ($HF_REPO) ==="
+HF_TOKEN="$HF_TOKEN" HF_REPO="$HF_REPO" $PY - <<'EOF'
+import os, json, datetime as dt
+from huggingface_hub import HfApi, login
+
+login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
+api = HfApi()
+repo = os.environ["HF_REPO"]
+
+# List all files in the dataset
+try:
+    files = list(api.list_repo_files(repo_id=repo, repo_type="dataset"))
+except Exception as exc:
+    print(f"  ERROR listing repo: {exc}")
+    raise SystemExit(0)
+
+# Group by run (top-level dir)
+runs = {}
+for f in files:
+    parts = f.split("/")
+    if len(parts) < 2:
+        continue
+    runs.setdefault(parts[0], []).append(f)
+
+print(f"  {len(runs)} run(s) on HF Hub")
+for run, run_files in sorted(runs.items()):
+    checkpoints = sorted({p.split("/")[1] for p in run_files if p.startswith(f"{run}/checkpoint-")})
+    has_final = any(p.endswith("/final_results.json") for p in run_files)
+    print(f"    {run}: {len(checkpoints)} ckpt | final={has_final}")
+
+# Recent commits — proxy for "is this run still progressing?"
+commits = list(api.list_repo_commits(repo_id=repo, repo_type="dataset"))[:20]
+now = dt.datetime.now(dt.timezone.utc)
+print()
+print(f"  Recent commits (last 20):")
+for c in commits:
+    age = now - c.created_at
+    age_h = age.total_seconds() / 3600
+    print(f"    [{age_h:5.1f}h ago] {c.commit_id[:8]} — {c.title[:80]}")
+
+if commits:
+    last_age_h = (now - commits[0].created_at).total_seconds() / 3600
+    print()
+    if last_age_h > 6:
+        print(f"  WARNING: no upload in {last_age_h:.1f} hours — possible stall")
+    else:
+        print(f"  Last activity: {last_age_h:.1f}h ago — healthy")
+EOF
 
 echo ""
-echo "=== SLURM QUEUE (current user) ==="
-squeue -u "\$USER" -o "%.10i %.9P %.20j %.2t %.10M %.10L %R" 2>&1 || echo "squeue unavailable"
+echo "=== LOCAL STATE (VPS) ==="
+df -h "$HOME" | head -2
+echo ""
+echo "Recent supervisor invocations (last 10):"
+tail -n 100 "${HOME}/.cache/gated-lora-supervisor.log" 2>/dev/null | grep -E "Invoking|Done at" | tail -10 || echo "  (no log yet)"
 
 echo ""
-echo "=== RUN DIRECTORIES ==="
-if [ -d "${REMOTE_OUTPUTS}" ]; then
-    for d in "${REMOTE_OUTPUTS}"/*/; do
-        [ -d "\$d" ] || continue
-        run=\$(basename "\$d")
-        size=\$(du -sh "\$d" 2>/dev/null | cut -f1)
-        done_marker="no"
-        [ -f "\$d/TRAINING_DONE" ] && done_marker="yes"
-        latest=\$(ls -1d "\$d"/checkpoint-* 2>/dev/null | sort -V | tail -1 | xargs -I {} basename {} 2>/dev/null || echo "none")
-        echo "  - \$run | size=\$size | done=\$done_marker | latest_ckpt=\$latest"
-    done
-else
-    echo "  (no outputs/ directory yet)"
-fi
-
-echo ""
-echo "=== LATEST FINAL_RESULTS (one per run, newest first) ==="
-find "${REMOTE_OUTPUTS}" -maxdepth 2 -name "final_results.json" -printf "%T@ %p\n" 2>/dev/null \
-  | sort -rn | head -10 | while read ts p; do
-    echo "--- \$p ---"
-    head -c 4000 "\$p" 2>/dev/null || true
-    echo ""
-done
-
-echo ""
-echo "=== RECENT SLURM LOG TAILS (last 60 lines, errors only) ==="
-if [ -d "${REMOTE_LOGS}" ]; then
-    for f in \$(ls -1t "${REMOTE_LOGS}"/*.err 2>/dev/null | head -5); do
-        echo "--- \$f ---"
-        tail -n 60 "\$f" 2>/dev/null | grep -iE "error|fail|nan|traceback|cuda|oom" | head -20 || echo "(no errors)"
-    done
-fi
+echo "Recent notifications:"
+tail -n 30 "${HOME}/.cache/gated-lora-notify.log" 2>/dev/null | tail -15 || echo "  (none)"
 
 echo ""
 echo "=== END ==="
-EOF
