@@ -1,0 +1,6 @@
+# All 8 tasks — used in harder_multitask + most model variants.
+data:
+  tasks: [squad, imdb, conll2003, wikitext, gsm8k, xsum, commonsenseqa, mnli]
+  weights: [0.12, 0.10, 0.12, 0.10, 0.15, 0.14, 0.14, 0.13]
+  max_samples_per_task: null
+  shuffle: true

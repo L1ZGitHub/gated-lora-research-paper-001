@@ -1,0 +1,6 @@
+# 6 diverse mid-difficulty tasks.
+data:
+  tasks: [squad, imdb, conll2003, gsm8k, xsum, commonsenseqa]
+  weights: [0.17, 0.14, 0.17, 0.20, 0.16, 0.16]
+  max_samples_per_task: null
+  shuffle: true

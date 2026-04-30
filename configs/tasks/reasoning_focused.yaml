@@ -1,0 +1,6 @@
+# Reasoning-focused subset (4 tasks).
+data:
+  tasks: [squad, gsm8k, commonsenseqa, mnli]
+  weights: [0.25, 0.30, 0.25, 0.20]
+  max_samples_per_task: null
+  shuffle: true

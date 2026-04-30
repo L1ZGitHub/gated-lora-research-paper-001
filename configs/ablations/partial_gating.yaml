@@ -1,0 +1,9 @@
+# Ablation: gate only a subset of layers (early + late).
+# Phi-2 has 32 layers. Gate only the "edges" (input/output adapters).
+ablation:
+  name: partial_gating
+  description: "Gating restricted to first-quarter and last-quarter layers"
+overrides:
+  model:
+    # First 8 layers + last 8 layers (out of 32 for Phi-2)
+    gated_layers: [0, 1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30, 31]

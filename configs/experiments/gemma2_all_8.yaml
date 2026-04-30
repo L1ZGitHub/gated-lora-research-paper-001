@@ -1,0 +1,17 @@
+# Gemma-2-2B gated × 8 tasks.
+extends:
+  - models/gemma2.yaml
+  - tasks/all_8.yaml
+
+experiment_name: gemma2_all_8
+description: |
+  Gemma-2-2B with gated LoRA trained on the 8-task mix.
+  Replicates ensicompute_Gemma-2.
+
+training:
+  num_epochs: 4
+
+output:
+  output_dir: ./outputs/gemma2_all_8
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: gemma2_all_8

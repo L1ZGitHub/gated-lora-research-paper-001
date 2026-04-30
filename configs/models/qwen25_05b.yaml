@@ -1,0 +1,51 @@
+# Qwen2.5-0.5B — small fast model with GQA (14q/2kv heads).
+model:
+  model_name: Qwen/Qwen2.5-0.5B
+  model_type: gated
+  torch_dtype: bfloat16
+  trust_remote_code: false
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  lora_target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  expert_ranks: [8, 16, 32]
+  expert_alphas: [16, 32, 64]
+  gating_hidden_dim: 256
+  gating_dropout: 0.1
+  per_layer_gating: true
+  gating_temperature: 1.0
+  use_layer_embedding: true
+  gated_layers: null
+  use_load_balancing: true
+  load_balancing_weight: 0.001
+  use_l1_gate_regularization: true
+  l1_gate_weight: 0.01
+
+training:
+  num_epochs: 4
+  batch_size: 8
+  gradient_accumulation_steps: 4  # effective batch = 32
+  learning_rate: 2e-4
+  bf16: true
+  fp16: false
+  max_length: 512
+  warmup_ratio: 0.1
+  scheduler: cosine
+  save_steps: 500
+  eval_steps: 500
+  log_routing_stats: true
+  vram_limit_gb: 22.0  # RTX 6000 (24GB)
+
+slurm:
+  partition: rtx6000
+  time: "04:00:00"
+  cpus_per_task: 8
+  mem: 32GB
+  exclude_nodes: []

@@ -1,0 +1,6 @@
+# 4 original tasks — used in early Phi-2 multirun experiments.
+data:
+  tasks: [squad, imdb, conll2003, wikitext]
+  weights: [0.30, 0.25, 0.25, 0.20]
+  max_samples_per_task: null   # null = use all
+  shuffle: true

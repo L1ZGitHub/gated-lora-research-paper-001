@@ -1,0 +1,18 @@
+# Pythia-410M gated × 8 tasks (GPT-NeoX architecture).
+extends:
+  - models/pythia410m.yaml
+  - tasks/all_8.yaml
+
+experiment_name: pythia410m_all_8
+description: |
+  Pythia-410M (GPT-NeoX) with gated LoRA trained on the 8-task mix.
+  Tests gating on combined QKV (query_key_value) projections.
+  Replicates ensicompute_Pythia-410M.
+
+training:
+  num_epochs: 4
+
+output:
+  output_dir: ./outputs/pythia410m_all_8
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: pythia410m_all_8

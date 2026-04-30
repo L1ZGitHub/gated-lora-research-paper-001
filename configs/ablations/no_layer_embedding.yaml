@@ -1,0 +1,8 @@
+# Ablation: disable layer-index embedding fed to the gating MLP.
+# Tests whether the gating relies on layer position to specialize.
+ablation:
+  name: no_layer_embedding
+  description: "Layer index embedding removed from gating input"
+overrides:
+  model:
+    use_layer_embedding: false

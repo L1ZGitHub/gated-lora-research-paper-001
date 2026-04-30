@@ -8,6 +8,7 @@ from .gated_trainer import (
     setup_logging_to_stdout,
 )
 from .trainer import LoRATrainer
+from .yaml_loader import load_config
 
 __all__ = [
     "ExperimentConfig",
@@ -18,4 +19,5 @@ __all__ = [
     "DEFAULT_MAX_RUNTIME_SECONDS",
     "create_optimizer_and_scheduler",
     "setup_logging_to_stdout",
+    "load_config",
 ]

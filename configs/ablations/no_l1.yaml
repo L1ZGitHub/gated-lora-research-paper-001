@@ -1,0 +1,9 @@
+# Ablation: disable L1 regularization on gate weights.
+# Tests whether sparsity-inducing L1 penalty is necessary.
+ablation:
+  name: no_l1
+  description: "L1 regularization on gate weights disabled"
+overrides:
+  model:
+    use_l1_gate_regularization: false
+    l1_gate_weight: 0.0
