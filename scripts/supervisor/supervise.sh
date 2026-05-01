@@ -81,9 +81,14 @@ EOF
 #    --append-system-prompt: load supervisor instructions
 echo "[supervise] Invoking Claude (model=opus-4.7, reason=$REASON)..."
 cd "$PROJECT_ROOT"
+# --permission-mode bypassPermissions: required for autonomous cron operation.
+# Tools are scoped via --allowed-tools to keep blast radius bounded.
+# (Read for state inspection; Bash limited to the safe verbs the prompt expects.)
 "$CLAUDE_BIN" \
     --model claude-opus-4-7 \
     --print \
+    --permission-mode bypassPermissions \
+    --allowed-tools "Read,Bash(python3:*),Bash(bash scripts/supervisor/notify.py:*),Bash(curl:*),Bash(huggingface-cli:*),Bash(cat:*),Bash(grep:*),Bash(ls:*),Bash(date:*)" \
     --append-system-prompt "$(cat "${PROJECT_ROOT}/scripts/supervisor/SUPERVISOR_PROMPT.md")" \
     < "$prompt_file" \
     | tee -a "${HOME}/.cache/gated-lora-supervisor.log"
