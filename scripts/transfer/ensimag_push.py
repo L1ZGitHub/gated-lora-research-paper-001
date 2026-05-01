@@ -149,6 +149,26 @@ def safe_unlink(path: Path, dry_run: bool) -> None:
     path.unlink()
 
 
+def push_single_run(run_dir: Path, hf_repo: str = "Helain/gated-lora-experiments") -> None:
+    """Library entry point: push a single run dir, called by the trainer post-save.
+
+    Re-authenticates against HF Hub on every call (compute nodes lose auth state
+    between SLURM jobs, so we can't assume a prior login is still valid).
+    Logs and swallows exceptions: a failed push must NOT crash training.
+    """
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token:
+        logger.warning("HF_TOKEN unset — skipping push for %s", run_dir.name)
+        return
+    try:
+        from huggingface_hub import HfApi, login
+        login(token=hf_token, add_to_git_credential=False)
+        api = HfApi()
+        process_run(api, run_dir, hf_repo, dry_run=False)
+    except Exception as exc:
+        logger.warning("Push failed for %s: %s (training continues)", run_dir.name, exc)
+
+
 def process_run(api, run_dir: Path, hf_repo: str, dry_run: bool) -> None:
     run_name = run_dir.name
     logger.info(f"=== {run_name} ===")

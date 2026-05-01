@@ -7,9 +7,14 @@
 #   GLR_OUTPUT_DIR   — output dir (overrides config's output.output_dir)
 #   GLR_PROJECT_ROOT — absolute path to repo root (where pyproject.toml lives)
 #
+# Auth:
+#   HF_TOKEN is loaded from $GLR_PROJECT_ROOT/.env at the start of every
+#   job (compute nodes don't persist auth state between SLURM allocations).
+#   Used both for downloading gated models AND for the trainer's post-save
+#   HF Hub push (gated_lora.training.gated_trainer.save_checkpoint).
+#
 # Optional:
 #   GLR_RESUME       — "auto" (default) or explicit checkpoint path
-#   GLR_HF_TOKEN     — HuggingFace token for gated models
 #   GLR_WANDB_MODE   — "online" / "offline" / "disabled" (default offline on Ensimag)
 #
 #SBATCH --job-name=glr
@@ -42,18 +47,24 @@ echo "Resume:    ${GLR_RESUME:-auto}"
 echo "Started:   $(date -Iseconds)"
 echo "==================================================================="
 
-# --- HF auth ---
-if [[ -n "${GLR_HF_TOKEN:-}" ]]; then
-    echo "HF token present — logging in"
-    huggingface-cli login --token "$GLR_HF_TOKEN" --add-to-git-credential 2>/dev/null \
-        || python -c "from huggingface_hub import login; login(token='$GLR_HF_TOKEN')"
+# --- Re-auth on every job (compute nodes don't keep state) ---
+if [[ -f "${GLR_PROJECT_ROOT}/.env" ]]; then
+    set -a; source "${GLR_PROJECT_ROOT}/.env"; set +a
+fi
+
+if [[ -z "${HF_TOKEN:-}" ]]; then
+    echo "WARNING: HF_TOKEN not set — gated model downloads + HF Hub push will fail" >&2
+else
+    echo "HF token loaded — logging in"
+    # Programmatic login is the canonical path; CLI is a no-op fallback for visibility
+    .venv/bin/python -c "from huggingface_hub import login; login(token='$HF_TOKEN', add_to_git_credential=False)"
 fi
 
 # --- Wandb mode (offline by default on compute nodes — no internet) ---
 export WANDB_MODE="${GLR_WANDB_MODE:-offline}"
 
 # --- Run training ---
-uv run python -m gated_lora.cli \
+.venv/bin/python -m gated_lora.cli \
     --config "$GLR_CONFIG" \
     --seed "$GLR_SEED" \
     --output-dir "$GLR_OUTPUT_DIR" \

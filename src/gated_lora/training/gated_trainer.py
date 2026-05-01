@@ -895,7 +895,18 @@ class GatedLoRATrainer:
         return done_file.exists()
 
     def save_checkpoint(self, name: str):
-        """Save model checkpoint."""
+        """Save model checkpoint, then push older checkpoints to HF Hub.
+
+        Push policy (best-effort, never crashes training):
+        - The just-saved checkpoint stays local — it may be needed for resume.
+        - All older `checkpoint-N/` (and `best_model`/`final_model`) are pushed
+          to `Helain/gated-lora-experiments/<run>/<ckpt>/` and deleted locally.
+        - On `TRAINING_DONE`, root files (`final_results.json`, `routing_history.json`,
+          figures) are pushed and the run dir is reduced to the marker.
+
+        Re-authentication on every call: compute nodes lose HF auth state
+        between SLURM jobs, so the push helper logs in fresh from HF_TOKEN.
+        """
         checkpoint_dir = self.output_dir / name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -916,16 +927,29 @@ class GatedLoRATrainer:
         state_dict = {
             "global_step": self.state.global_step,
             "epoch": self.state.epoch,
-            "batch_idx": self.state.batch_idx,  # NEW
+            "batch_idx": self.state.batch_idx,
             "best_eval_loss": self.state.best_eval_loss,
             "warmup_completed": self.state.warmup_completed,
-            "total_train_loss": self.state.total_train_loss,  # NEW
-            "num_train_steps": self.state.num_train_steps,  # NEW
+            "total_train_loss": self.state.total_train_loss,
+            "num_train_steps": self.state.num_train_steps,
         }
         with open(checkpoint_dir / "training_state.json", "w") as f:
             json.dump(state_dict, f, indent=2)
 
         logger.info(f"Saved checkpoint to {checkpoint_dir}")
+
+        # Best-effort post-save push (older checkpoints → HF Hub, then delete).
+        # Skipped silently if HF_TOKEN missing or push module unavailable.
+        try:
+            import sys
+            from pathlib import Path as _P
+            scripts_dir = _P(__file__).resolve().parents[3] / "scripts" / "transfer"
+            if str(scripts_dir) not in sys.path:
+                sys.path.insert(0, str(scripts_dir))
+            from ensimag_push import push_single_run
+            push_single_run(_P(self.output_dir))
+        except Exception as exc:
+            logger.warning(f"post-save push skipped ({type(exc).__name__}): {exc}")
 
     def load_checkpoint(self, path: str):
         """Load model checkpoint."""
