@@ -26,16 +26,20 @@ if [[ -f "$ENV_FILE" ]]; then
     set -a; source "$ENV_FILE"; set +a
 fi
 
-if ! command -v claude >/dev/null 2>&1; then
-    echo "[supervise] ERROR: 'claude' CLI not found on PATH" >&2
+# Cron environments typically don't include ~/.local/bin — extend PATH explicitly
+export PATH="${HOME}/.local/bin:${PATH}"
+
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || echo "${HOME}/.local/bin/claude")}"
+if [[ ! -x "$CLAUDE_BIN" ]]; then
+    echo "[supervise] ERROR: claude CLI not found at $CLAUDE_BIN" >&2
     exit 1
 fi
 
-# 1. Gather state (single SSH call)
+# 1. Gather state (HF Hub-based — no SSH to Ensimag possible from VPS)
 state_file=$(mktemp -t glr-state.XXXXXX)
 trap 'rm -f "$state_file"' EXIT
 
-echo "[supervise] Gathering Ensimag state..."
+echo "[supervise] Gathering state via HF Hub..."
 if ! bash "${PROJECT_ROOT}/scripts/supervisor/gather_state.sh" > "$state_file" 2>&1; then
     "${PROJECT_ROOT}/scripts/supervisor/notify.py" \
         --level critical \
@@ -77,7 +81,7 @@ EOF
 #    --append-system-prompt: load supervisor instructions
 echo "[supervise] Invoking Claude (model=opus-4.7, reason=$REASON)..."
 cd "$PROJECT_ROOT"
-claude \
+"$CLAUDE_BIN" \
     --model claude-opus-4-7 \
     --print \
     --append-system-prompt "$(cat "${PROJECT_ROOT}/scripts/supervisor/SUPERVISOR_PROMPT.md")" \

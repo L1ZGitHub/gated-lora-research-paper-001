@@ -64,3 +64,4 @@ htmlcov/
 
 # Lock files (uv handles these)
 # uv.lock IS committed
+*:Zone.Identifier

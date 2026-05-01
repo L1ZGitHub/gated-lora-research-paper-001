@@ -1,0 +1,24 @@
+# Experiments to run (in order). Lines starting with # are comments.
+# Format: <config_path> <seed1> [<seed2> ...]
+#
+# The supervisor reads this to:
+#  - know what's "in flight" vs "idle" (avoids false stall warnings)
+#  - suggest the next experiment to launch when the user is idle
+#
+# The user (or a Claude Code session) updates this file as the paper progresses.
+# Empty / all-commented = idle (supervisor emits info only, no warnings).
+
+# === Phase 1: Phi-2 baseline (smoke test, then 3 seeds for paper) ===
+configs/experiments/phi2_harder_multitask.yaml 42
+
+# === Phase 2: Architecture sweep (one seed each, smoke first) ===
+# configs/experiments/gemma2_all_8.yaml 42
+# configs/experiments/pythia410m_all_8.yaml 42
+
+# === Phase 3: Multi-seed for the chosen models (paper figures) ===
+# configs/experiments/phi2_harder_multitask.yaml 1337 2024
+# configs/experiments/gemma2_all_8.yaml 1337 2024
+# configs/experiments/pythia410m_all_8.yaml 1337 2024
+
+# === Phase 4: Ablations (Phi-2 only) ===
+# configs/experiments/phi2_ablation_no_l1.yaml 42 1337 2024

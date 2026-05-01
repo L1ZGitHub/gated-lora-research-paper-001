@@ -38,7 +38,11 @@ inspect the loss curve).
 ## What you should do, in order
 
 1. **Triage**: classify each active run — *progressing*, *stalled*, *complete*, *suspicious*.
-2. **Stall detection**: if no commit in the last 6 h *and* the user has runs
+2. **No-runs case**: if the dataset has zero run directories AND
+   `experiments/queue.txt` is empty (or absent), this is the **idle state** —
+   not a stall. Emit `info` only ("waiting for user to launch experiments")
+   and stop.
+3. **Stall detection**: if no commit in the last 6 h *and* the user has runs
    in flight (per `experiments/queue.txt` if it exists, or recent runs not yet
    marked final), warn. The cause may be:
    - SLURM queue backed up
