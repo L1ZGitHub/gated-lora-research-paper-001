@@ -70,9 +70,16 @@ for ((i=1; i<=MAX_JOBS; i++)); do
 
     echo "[chain] Submitting job $i / $MAX_JOBS at $(date -Iseconds)"
 
-    # Submit and capture job id
+    # Submit and capture job id.
+    # --chdir + absolute --output/--error keep compute nodes on the symlinked
+    # path (/user/2/zimmermh/...) — Ensimag compute nodes deny access to the
+    # resolved canonical path (/user/2/.base/...) that sbatch would derive
+    # otherwise, and the job dies before bash even starts (signal 53).
     job_output=$(sbatch \
         --partition="$PARTITION" \
+        --chdir="$PROJECT_ROOT" \
+        --output="${PROJECT_ROOT}/logs/%x_%j.out" \
+        --error="${PROJECT_ROOT}/logs/%x_%j.err" \
         --export=ALL,GLR_CONFIG="$CONFIG",GLR_SEED="$SEED",GLR_OUTPUT_DIR="$OUTPUT_DIR",GLR_PROJECT_ROOT="$PROJECT_ROOT",GLR_RESUME="auto" \
         "${PROJECT_ROOT}/scripts/slurm/train.sbatch")
 
