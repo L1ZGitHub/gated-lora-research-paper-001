@@ -21,10 +21,12 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --time=04:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48GB
-#SBATCH --nodelist=turing-[4-9]   # 6 of 9 turing nodes (rtx6000 partition)
+#SBATCH --nodelist=turing-[4-9]   # restrict to 6 of 9 turing nodes (rtx6000)
 
 set -euo pipefail
 
