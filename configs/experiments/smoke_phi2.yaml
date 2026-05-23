@@ -11,14 +11,19 @@ training:
   num_epochs: 1
   max_steps: 5
   save_steps: 2          # save at steps 2, 4 → push to HF
-  eval_steps: 2
-  warmup_ratio: 0.0      # skip warmup so we hit the training loop immediately
+  eval_steps: 9999       # never inside the 5-step smoke (full eval = 7k samples × bs1 ≈ 2h)
+  warmup_ratio: 0.0
   logging_steps: 1
   # Tiny batch — the smoke runs on any partition (rtx6000 24 GB or a40 46 GB)
   # and validates the pipeline, not throughput.
   batch_size: 1
   gradient_accumulation_steps: 1
   max_length: 256
+  early_stopping_patience: 9999  # don't try to early-stop in a 5-step run
+
+data:
+  # Smoke is about pipeline plumbing — small dataset slice keeps loading fast.
+  max_samples_per_task: 50
 
 output:
   output_dir: ./outputs/smoke_phi2
