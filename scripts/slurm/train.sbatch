@@ -51,6 +51,16 @@ RESUME="${GLR_RESUME:-auto}"
 
 JOB_ID="${SLURM_JOB_ID:-local-$$}"
 WORK="/tmp/glr-${JOB_ID}"
+
+# Opportunistic /tmp hygiene: failed prior jobs leave 5+ GB tarballs around
+# (e.g. partial uv caches). Anything older than 30 min that matches /tmp/glr-*
+# belongs to a finished job (compute /tmp is local — no other user can write
+# our pattern). Remove proactively so we don't OOM the disk on scipy install.
+find /tmp -maxdepth 1 -name "glr-*" -mmin +30 -type d 2>/dev/null \
+    -exec rm -rf {} \; 2>/dev/null || true
+find /tmp -maxdepth 1 -name "glr-*.out" -mmin +60 -type f -delete 2>/dev/null || true
+find /tmp -maxdepth 1 -name "glr-*.err" -mmin +60 -type f -delete 2>/dev/null || true
+
 mkdir -p "$WORK"
 cd "$WORK"
 
@@ -112,6 +122,8 @@ for kind in ("out", "err"):
     except Exception as e:
         print(f"[trap] upload failed for {p}: {e}", flush=True)
 PYEOF
+    # Reclaim disk so the next job on this node doesn't hit ENOSPC.
+    rm -rf "$WORK" 2>/dev/null || true
     echo "[exit] code=$rc at $(date -Iseconds)"
     exit $rc
 }
