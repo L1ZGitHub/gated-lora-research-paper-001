@@ -22,8 +22,9 @@ training:
   early_stopping_patience: 9999  # don't try to early-stop in a 5-step run
 
 data:
-  # Smoke is about pipeline plumbing — small dataset slice keeps loading fast.
-  max_samples_per_task: 50
+  # Smoke is about pipeline plumbing — 2 samples per task × 8 tasks = 16 batches.
+  # Trainer has no max_steps support (only num_epochs), so we cap via samples.
+  max_samples_per_task: 2
 
 output:
   output_dir: ./outputs/smoke_phi2
