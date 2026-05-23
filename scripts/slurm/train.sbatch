@@ -75,32 +75,43 @@ echo "  Resume   : $RESUME"
 echo "  HF repo  : $HF_REPO"
 echo "==================================================================="
 
+# Install huggingface_hub into $HOME/.local FIRST (Python comes with the OS,
+# pip + --break-system-packages handles PEP 668). This way the EXIT trap can
+# always upload SLURM logs even if a later stage-in step blows up.
+python3 -m pip install --quiet --user --break-system-packages huggingface_hub 2>&1 | tail -3 || true
+
 # Best-effort: upload the SLURM .out/.err to HF when this script exits.
 upload_slurm_logs() {
     local rc=$?
     set +e
-    local out="/tmp/glr-${JOB_ID}.out" err="/tmp/glr-${JOB_ID}.err"
-    if [[ -x "$WORK/glr/.venv/bin/python" ]]; then
-        "$WORK/glr/.venv/bin/python" - <<EOF || true
+    if ! python3 -c "import huggingface_hub" 2>/dev/null; then
+        echo "[trap] huggingface_hub unavailable — cannot upload logs (rc=$rc)"
+        echo "[exit] code=$rc at $(date -Iseconds)"
+        exit $rc
+    fi
+    GLR_JOB_ID="$JOB_ID" GLR_HF_REPO_TRAP="$HF_REPO" GLR_RUN_NAME_TRAP="$GLR_RUN_NAME" \
+        HF_TOKEN="$HF_TOKEN" python3 - <<'PYEOF'
 import os
 from huggingface_hub import HfApi, login
-try:
-    login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
-    api = HfApi()
-    for p in ("$out", "$err"):
-        try:
-            api.upload_file(
-                path_or_fileobj=p,
-                path_in_repo=f"{os.environ['GLR_RUN_NAME']}/slurm_logs/{p.split('/')[-1]}",
-                repo_id="$HF_REPO", repo_type="dataset",
-                commit_message=f"slurm log {p.split('/')[-1]}",
-            )
-        except Exception as e:
-            print(f"  log upload skipped ({p}): {e}", flush=True)
-except Exception as e:
-    print(f"  HF login failed for log upload: {e}", flush=True)
-EOF
-    fi
+login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
+api = HfApi()
+job_id = os.environ["GLR_JOB_ID"]
+repo   = os.environ["GLR_HF_REPO_TRAP"]
+run    = os.environ["GLR_RUN_NAME_TRAP"]
+for kind in ("out", "err"):
+    p = f"/tmp/glr-{job_id}.{kind}"
+    if not os.path.isfile(p):
+        continue
+    try:
+        api.upload_file(
+            path_or_fileobj=p,
+            path_in_repo=f"{run}/slurm_logs/glr-{job_id}.{kind}",
+            repo_id=repo, repo_type="dataset",
+            commit_message=f"slurm log glr-{job_id}.{kind}",
+        )
+    except Exception as e:
+        print(f"[trap] upload failed for {p}: {e}", flush=True)
+PYEOF
     echo "[exit] code=$rc at $(date -Iseconds)"
     exit $rc
 }
