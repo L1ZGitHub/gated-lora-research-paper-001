@@ -102,8 +102,16 @@ for ((i=1; i<=MAX_JOBS; i++)); do
     fi
 
     echo "[chain] Submitting job $i / $MAX_JOBS at $(date -Iseconds)"
+    # Partition-specific nodelist:
+    #   rtx6000 = restrict to 6 of 9 turing nodes (per agreement with the user)
+    #   a40     = only the "ampere" node exists, let SLURM pick automatically
+    NODELIST_ARG=()
+    case "$PARTITION" in
+        rtx6000) NODELIST_ARG=(--nodelist=turing-[4-9]) ;;
+    esac
     job_output=$(sbatch \
         --partition="$PARTITION" \
+        "${NODELIST_ARG[@]}" \
         --export=ALL,GLR_CONFIG="$CONFIG",GLR_SEED="$SEED",GLR_RUN_NAME="$RUN_NAME",HF_TOKEN="$HF_TOKEN",GLR_HF_REPO="$HF_REPO",GLR_RESUME="auto" \
         "${PROJECT_ROOT}/scripts/slurm/train.sbatch")
 

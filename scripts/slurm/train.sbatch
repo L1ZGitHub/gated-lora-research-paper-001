@@ -34,7 +34,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48GB
-#SBATCH --nodelist=turing-[4-9]
+# NOTE: --nodelist is set conditionally by chain_jobs.sh — depends on partition.
 
 set -euo pipefail
 

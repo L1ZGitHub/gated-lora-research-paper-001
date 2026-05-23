@@ -14,6 +14,11 @@ training:
   eval_steps: 2
   warmup_ratio: 0.0      # skip warmup so we hit the training loop immediately
   logging_steps: 1
+  # Tiny batch — the smoke runs on any partition (rtx6000 24 GB or a40 46 GB)
+  # and validates the pipeline, not throughput.
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_length: 256
 
 output:
   output_dir: ./outputs/smoke_phi2
