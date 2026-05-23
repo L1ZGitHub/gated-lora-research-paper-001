@@ -1,0 +1,21 @@
+# Smoke test — Phi-2 with the harder_multitask mixture but capped at 5 steps.
+# Purpose: verify the stage-in/stage-out pipeline (git clone → uv sync → HF push)
+# end-to-end without burning 4h of compute. Should finish in ~10-15 min.
+extends:
+  - models/phi2.yaml
+  - tasks/all_8.yaml
+
+experiment_name: smoke_phi2
+
+training:
+  num_epochs: 1
+  max_steps: 5
+  save_steps: 2          # save at steps 2, 4 → push to HF
+  eval_steps: 2
+  warmup_ratio: 0.0      # skip warmup so we hit the training loop immediately
+  logging_steps: 1
+
+output:
+  output_dir: ./outputs/smoke_phi2
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: smoke_phi2
