@@ -14,6 +14,7 @@ config object, or use directly when only a subset of fields is needed.
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 from typing import Any, Dict
 
@@ -21,6 +22,34 @@ import yaml
 
 
 CONFIGS_ROOT = Path(__file__).resolve().parents[3] / "configs"
+
+
+class _Yaml12FloatLoader(yaml.SafeLoader):
+    """SafeLoader patched with the YAML 1.2 float resolver.
+
+    PyYAML's default SafeLoader implements YAML 1.1, which requires a leading
+    sign or decimal point in scientific notation (``2.0e-4`` or ``+2e-4``).
+    Without it, ``learning_rate: 2e-4`` is parsed as the string ``"2e-4"`` and
+    quietly breaks downstream (e.g. ``torch.optim.AdamW`` raises
+    ``TypeError: '<=' not supported between instances of 'float' and 'str'``).
+    Switching to YAML 1.2's float regex makes ``2e-4`` parse as a float.
+    """
+
+
+_Yaml12FloatLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:float",
+    re.compile(
+        r"""^(?:
+        [-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+       |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
+       |\.[0-9_]+(?:[eE][-+]?[0-9]+)?
+       |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*
+       |[-+]?\.(?:inf|Inf|INF)
+       |\.(?:nan|NaN|NAN))$""",
+        re.X,
+    ),
+    list("-+0123456789."),
+)
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -68,7 +97,7 @@ def load_config(path: str | Path) -> Dict[str, Any]:
     """
     full_path = _resolve_path(path)
     with open(full_path) as f:
-        raw = yaml.safe_load(f) or {}
+        raw = yaml.load(f, Loader=_Yaml12FloatLoader) or {}
 
     extends = raw.pop("extends", [])
     overrides = raw.pop("overrides", None)

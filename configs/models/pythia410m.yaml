@@ -29,7 +29,7 @@ training:
   num_epochs: 4
   batch_size: 6
   gradient_accumulation_steps: 5  # effective batch = 30
-  learning_rate: 2e-4
+  learning_rate: 2.0e-4
   bf16: true
   fp16: false
   max_length: 512

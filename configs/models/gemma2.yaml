@@ -32,7 +32,7 @@ training:
   num_epochs: 4
   batch_size: 4  # reduced for Gemma-2 256k vocab
   gradient_accumulation_steps: 8  # effective batch = 32
-  learning_rate: 2e-4
+  learning_rate: 2.0e-4
   bf16: true
   fp16: false
   max_length: 512
