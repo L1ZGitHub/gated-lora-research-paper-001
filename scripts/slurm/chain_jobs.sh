@@ -1,5 +1,8 @@
 #!/bin/bash
-# Orchestrate SLURM job chaining until TRAINING_DONE marker appears.
+# Submit SLURM jobs in a loop until TRAINING_DONE appears on HF Hub.
+#
+# State of truth: Hugging Face Hub (Helain/gated-lora-experiments).
+# Login node has no visibility into compute /tmp, so we poll HF instead.
 #
 # Usage:
 #   bash scripts/slurm/chain_jobs.sh \
@@ -7,17 +10,9 @@
 #       --seed 42 \
 #       [--max-jobs 10] \
 #       [--partition rtx6000] \
-#       [--output-dir ./outputs/phi2_harder_multitask_seed42]
+#       [--run-name <override>]
 #
-# Behavior:
-#   1. Submit job N via sbatch (uses train.sbatch).
-#   2. Wait for job to complete (polls squeue every 60s).
-#   3. Check $output_dir/TRAINING_DONE.
-#      - If exists → success, exit 0.
-#      - If absent and N < max_jobs → resubmit with same args (resume=auto).
-#      - If N == max_jobs → exit with error code 2 (didn't converge in budget).
-#
-# Designed to be invoked from VPS via SSH or interactively on Ensimag login node.
+# Exit codes: 0 done, 1 bad args, 2 budget exhausted.
 
 set -euo pipefail
 
@@ -25,85 +20,109 @@ CONFIG=""
 SEED=""
 MAX_JOBS=10
 PARTITION="rtx6000"
-OUTPUT_DIR=""
+RUN_NAME=""
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+HF_REPO="${GLR_HF_REPO:-Helain/gated-lora-experiments}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --config)      CONFIG="$2"; shift 2 ;;
-        --seed)        SEED="$2"; shift 2 ;;
-        --max-jobs)    MAX_JOBS="$2"; shift 2 ;;
-        --partition)   PARTITION="$2"; shift 2 ;;
-        --output-dir)  OUTPUT_DIR="$2"; shift 2 ;;
-        *)             echo "Unknown arg: $1" >&2; exit 1 ;;
+        --config)     CONFIG="$2"; shift 2 ;;
+        --seed)       SEED="$2"; shift 2 ;;
+        --max-jobs)   MAX_JOBS="$2"; shift 2 ;;
+        --partition)  PARTITION="$2"; shift 2 ;;
+        --run-name)   RUN_NAME="$2"; shift 2 ;;
+        *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
 done
 
 [[ -z "$CONFIG" ]] && { echo "ERROR: --config required" >&2; exit 1; }
 [[ -z "$SEED"   ]] && { echo "ERROR: --seed required"   >&2; exit 1; }
 
-# Default output dir from config name + seed
-if [[ -z "$OUTPUT_DIR" ]]; then
-    config_basename=$(basename "$CONFIG" .yaml)
-    OUTPUT_DIR="${PROJECT_ROOT}/outputs/${config_basename}_seed${SEED}"
+# Load HF_TOKEN from .env at repo root
+if [[ -f "$PROJECT_ROOT/.env" ]]; then
+    set -a; source "$PROJECT_ROOT/.env"; set +a
+fi
+if [[ -z "${HF_TOKEN:-}" ]]; then
+    echo "ERROR: HF_TOKEN not set (looked in $PROJECT_ROOT/.env)" >&2
+    exit 1
 fi
 
-DONE_MARKER="${OUTPUT_DIR}/TRAINING_DONE"
+# Default run name
+if [[ -z "$RUN_NAME" ]]; then
+    config_basename=$(basename "$CONFIG" .yaml)
+    RUN_NAME="${config_basename}_seed${SEED}"
+fi
+
+# Pick the right Python — prefer the project venv if it exists, else system.
+PY=""
+for candidate in "$PROJECT_ROOT/.venv/bin/python" "$(command -v python3 || true)"; do
+    if [[ -x "$candidate" ]]; then
+        if "$candidate" -c "import huggingface_hub" 2>/dev/null; then
+            PY="$candidate"
+            break
+        fi
+    fi
+done
+if [[ -z "$PY" ]]; then
+    echo "ERROR: no Python with huggingface_hub found." >&2
+    echo "  Try: cd $PROJECT_ROOT && uv sync --no-dev" >&2
+    exit 1
+fi
 
 echo "==================================================================="
 echo "Chain orchestrator"
 echo "  Config:    $CONFIG"
 echo "  Seed:      $SEED"
-echo "  Output:    $OUTPUT_DIR"
+echo "  Run name:  $RUN_NAME"
+echo "  HF repo:   $HF_REPO"
 echo "  Partition: $PARTITION"
 echo "  Max jobs:  $MAX_JOBS"
-echo "  Marker:    $DONE_MARKER"
+echo "  Python:    $PY"
 echo "==================================================================="
 
-mkdir -p "$OUTPUT_DIR" "${PROJECT_ROOT}/logs"
+# Check HF Hub for TRAINING_DONE on this run.
+check_done() {
+    HF_TOKEN="$HF_TOKEN" "$PY" - <<EOF
+import os, sys
+from huggingface_hub import HfApi, login
+login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
+try:
+    files = HfApi().list_repo_files(repo_id="$HF_REPO", repo_type="dataset")
+    sys.exit(0 if any(f == "$RUN_NAME/TRAINING_DONE" for f in files) else 1)
+except Exception as e:
+    print(f"  HF check failed: {e}", file=sys.stderr)
+    sys.exit(2)  # treat as "unknown" — let the loop retry next iteration
+EOF
+}
 
 for ((i=1; i<=MAX_JOBS; i++)); do
-    if [[ -f "$DONE_MARKER" ]]; then
-        echo "[chain] TRAINING_DONE found — exiting after $((i-1)) job(s)"
+    if check_done; then
+        echo "[chain] HF Hub has $RUN_NAME/TRAINING_DONE — done after $((i-1)) job(s)"
         exit 0
     fi
 
     echo "[chain] Submitting job $i / $MAX_JOBS at $(date -Iseconds)"
-
-    # Submit and capture job id.
-    # --chdir + absolute --output/--error keep compute nodes on the symlinked
-    # path (/user/2/zimmermh/...) — Ensimag compute nodes deny access to the
-    # resolved canonical path (/user/2/.base/...) that sbatch would derive
-    # otherwise, and the job dies before bash even starts (signal 53).
     job_output=$(sbatch \
         --partition="$PARTITION" \
-        --chdir="$PROJECT_ROOT" \
-        --output="${PROJECT_ROOT}/logs/%x_%j.out" \
-        --error="${PROJECT_ROOT}/logs/%x_%j.err" \
-        --export=ALL,GLR_CONFIG="$CONFIG",GLR_SEED="$SEED",GLR_OUTPUT_DIR="$OUTPUT_DIR",GLR_PROJECT_ROOT="$PROJECT_ROOT",GLR_RESUME="auto" \
+        --export=ALL,GLR_CONFIG="$CONFIG",GLR_SEED="$SEED",GLR_RUN_NAME="$RUN_NAME",HF_TOKEN="$HF_TOKEN",GLR_HF_REPO="$HF_REPO",GLR_RESUME="auto" \
         "${PROJECT_ROOT}/scripts/slurm/train.sbatch")
 
     job_id=$(echo "$job_output" | grep -oP '\d+$')
     if [[ -z "$job_id" ]]; then
-        echo "[chain] ERROR: could not parse job id from sbatch output:" >&2
-        echo "$job_output" >&2
+        echo "[chain] ERROR: could not parse job id from: $job_output" >&2
         exit 1
     fi
-
     echo "[chain] Submitted job $job_id, polling..."
 
-    # Poll squeue until job leaves the queue
     while squeue -j "$job_id" -h 2>/dev/null | grep -q "^"; do
         sleep 60
     done
-
-    echo "[chain] Job $job_id finished at $(date -Iseconds)"
+    echo "[chain] Job $job_id left the queue at $(date -Iseconds)"
 done
 
-if [[ -f "$DONE_MARKER" ]]; then
-    echo "[chain] TRAINING_DONE found in final iteration — success"
+if check_done; then
+    echo "[chain] Final TRAINING_DONE check OK — success"
     exit 0
 fi
-
-echo "[chain] ERROR: hit max-jobs limit ($MAX_JOBS) without TRAINING_DONE marker" >&2
+echo "[chain] ERROR: budget exhausted ($MAX_JOBS jobs) without TRAINING_DONE" >&2
 exit 2

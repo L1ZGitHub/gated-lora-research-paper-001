@@ -37,10 +37,14 @@ from typing import Iterable, List
 
 logger = logging.getLogger(__name__)
 
-# Files we never upload (rotated by trainer, only useful for local resume)
-EXCLUDE_FILES = {"optimizer.pt"}
-# Subdirs we never touch (live state for SLURM resume)
-KEEP_DIRS = {"checkpoint-LATEST", "latest"}
+# Files we never upload (transient compute-local caches)
+EXCLUDE_FILES = set()  # optimizer.pt MUST go to HF for stage-in resume across jobs
+
+# In stage-in/stage-out mode on Ensimag compute, /tmp is wiped between jobs.
+# The "latest" checkpoint therefore MUST be pushed to HF so the next job can
+# pull it for resume. But we ALSO keep it locally during the same job for the
+# trainer's in-process resume logic.
+KEEP_LOCAL_AFTER_PUSH = {"checkpoint-LATEST", "latest"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,19 +70,13 @@ def setup_logging(verbose: bool) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def list_completed_checkpoints(run_dir: Path) -> List[Path]:
-    """Return checkpoint-N/ dirs that are NOT the live LATEST.
-
-    Trainer guarantees: at most one ``checkpoint-LATEST`` (or ``latest``)
-    holds optimizer.pt. All other ``checkpoint-N/`` are safe to ship.
-    """
+def list_all_checkpoint_dirs(run_dir: Path) -> List[Path]:
+    """All checkpoint-shaped subdirs (numbered + named like best_model/final_model + latest)."""
     out = []
     for child in sorted(run_dir.iterdir()):
         if not child.is_dir():
             continue
-        if child.name in KEEP_DIRS:
-            continue
-        if child.name.startswith("checkpoint-") or child.name in {"best_model", "final_model"}:
+        if child.name.startswith("checkpoint-") or child.name in {"best_model", "final_model", "latest"}:
             out.append(child)
     return out
 
@@ -109,13 +107,18 @@ def upload_dir(api, src: Path, hf_repo: str, hf_path: str) -> None:
 
 
 def upload_run_root_files(api, run_dir: Path, hf_repo: str, hf_path: str) -> List[Path]:
-    """Upload root-level non-checkpoint files. Returns list of files uploaded."""
+    """Upload root-level non-checkpoint files. Returns list of files uploaded.
+
+    TRAINING_DONE is included so login-side orchestrators (chain_jobs.sh) can
+    discover completion via HF API without needing access to compute /tmp.
+    """
     candidates = [
         run_dir / name
         for name in (
             "final_results.json",
             "routing_history.json",
             "experiment_config.json",
+            "TRAINING_DONE",
         )
     ]
     candidates.extend(run_dir.glob("*.png"))
@@ -173,10 +176,27 @@ def process_run(api, run_dir: Path, hf_repo: str, dry_run: bool) -> None:
     run_name = run_dir.name
     logger.info(f"=== {run_name} ===")
 
-    # Phase 1: ship completed checkpoints (skip LATEST, skip already-uploaded)
-    for ckpt in list_completed_checkpoints(run_dir):
+    # Phase 1: ship every checkpoint dir.
+    # - Numbered checkpoints + best_model + final_model: push once (tracked in
+    #   .uploaded), then delete locally.
+    # - "latest" / "checkpoint-LATEST": always re-push (content changes each save)
+    #   and KEEP local — the in-process trainer needs it for resume within the
+    #   current job; the next SLURM job pulls it from HF for cross-job resume.
+    for ckpt in list_all_checkpoint_dirs(run_dir):
+        is_latest = ckpt.name in KEEP_LOCAL_AFTER_PUSH
+
+        if is_latest:
+            logger.info(f"  uploading {ckpt.name} (live state, kept local)")
+            if not dry_run:
+                upload_dir(api, ckpt, hf_repo, f"{run_name}/{ckpt.name}")
+            # NEVER delete latest
+            continue
+
         if already_uploaded(run_dir, ckpt.name):
             logger.debug(f"  already uploaded: {ckpt.name}")
+            # Still safe to clean up if it's somehow stuck around
+            if ckpt.exists():
+                safe_rmtree(ckpt, dry_run)
             continue
 
         logger.info(f"  uploading {ckpt.name}")
@@ -185,22 +205,14 @@ def process_run(api, run_dir: Path, hf_repo: str, dry_run: bool) -> None:
             mark_uploaded(run_dir, ckpt.name)
         safe_rmtree(ckpt, dry_run)
 
-    # Phase 2: if run is complete, ship root files + clean up everything but the marker
+    # Phase 2: if run is complete, ship root files (incl. TRAINING_DONE).
+    # We do NOT wipe the run_dir here — /tmp is wiped by SLURM at job end.
     done_marker = run_dir / "TRAINING_DONE"
     if done_marker.exists():
-        logger.info(f"  TRAINING_DONE present — final cleanup")
+        logger.info(f"  TRAINING_DONE present — uploading run metadata")
         if not dry_run:
             uploaded_root_files = upload_run_root_files(api, run_dir, hf_repo, run_name)
             logger.info(f"  uploaded {len(uploaded_root_files)} root file(s)")
-
-        # Delete everything except TRAINING_DONE (marker remains for chain_jobs.sh)
-        for child in list(run_dir.iterdir()):
-            if child.name == "TRAINING_DONE":
-                continue
-            if child.is_dir():
-                safe_rmtree(child, dry_run)
-            else:
-                safe_unlink(child, dry_run)
 
 
 def main() -> int:

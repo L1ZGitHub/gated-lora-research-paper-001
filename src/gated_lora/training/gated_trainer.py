@@ -869,6 +869,20 @@ class GatedLoRATrainer:
         # Mark training as done
         self._mark_training_done()
 
+        # Final push so TRAINING_DONE (and any straggler files) land on HF Hub
+        # before this SLURM job exits — login-side chain_jobs.sh polls HF to
+        # decide whether to resubmit, so the marker MUST be there.
+        try:
+            import sys
+            from pathlib import Path as _P
+            scripts_dir = _P(__file__).resolve().parents[3] / "scripts" / "transfer"
+            if str(scripts_dir) not in sys.path:
+                sys.path.insert(0, str(scripts_dir))
+            from ensimag_push import push_single_run
+            push_single_run(_P(self.output_dir))
+        except Exception as exc:
+            logger.warning(f"final push skipped ({type(exc).__name__}): {exc}")
+
         return {
             "status": "completed",
             "final_train_loss": self.state.total_train_loss / max(self.state.num_train_steps, 1),
