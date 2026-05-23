@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -160,16 +161,31 @@ def run_experiment(config: ExperimentConfig, *, analyze_routing: bool = False) -
         model=model, config=config, num_training_steps=total_steps
     )
 
-    if WANDB_AVAILABLE and config.wandb.enabled and config.wandb.mode != "disabled":
-        wandb.init(
-            project=config.wandb.project,
-            entity=config.wandb.entity,
-            name=config.wandb.name or config.experiment_name,
-            tags=config.wandb.tags,
-            notes=config.wandb.notes,
-            config=config.to_dict(),
-            mode=config.wandb.mode,
-        )
+    # wandb is best-effort. Env var WANDB_MODE wins over config.wandb.mode so
+    # SLURM jobs can disable it without touching YAML. Init failures (no API
+    # key, no network, etc.) must NOT crash training — we already push every
+    # artifact to HF Hub.
+    env_mode = os.environ.get("WANDB_MODE", "").lower()
+    cfg_mode = (config.wandb.mode or "").lower()
+    effective_mode = env_mode or cfg_mode
+    wandb_off = (
+        effective_mode in {"disabled", "off"}
+        or not config.wandb.enabled
+        or not WANDB_AVAILABLE
+    )
+    if not wandb_off:
+        try:
+            wandb.init(
+                project=config.wandb.project,
+                entity=config.wandb.entity,
+                name=config.wandb.name or config.experiment_name,
+                tags=config.wandb.tags,
+                notes=config.wandb.notes,
+                config=config.to_dict(),
+                mode=effective_mode or "offline",
+            )
+        except Exception as exc:
+            logger.warning(f"wandb.init failed, continuing without wandb: {exc}")
 
     trainer = GatedLoRATrainer(
         model=model,

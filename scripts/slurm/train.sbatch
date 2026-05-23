@@ -61,7 +61,8 @@ export HOME="$WORK"
 export HF_HOME="$WORK/hf_cache"
 export UV_CACHE_DIR="$WORK/uv_cache"
 export WANDB_DIR="$WORK/wandb"
-export WANDB_MODE="${GLR_WANDB_MODE:-offline}"
+export WANDB_MODE="${GLR_WANDB_MODE:-disabled}"
+export WANDB_DISABLE_SERVICE=true
 mkdir -p "$HF_HOME" "$UV_CACHE_DIR" "$WANDB_DIR"
 
 echo "==================================================================="
