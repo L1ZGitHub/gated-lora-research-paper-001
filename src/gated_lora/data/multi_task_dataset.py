@@ -364,15 +364,21 @@ class MultiTaskDatasetLoader:
     def _load_conll(self, split: str = "train") -> List[str]:
         """Load CoNLL-2003 dataset.
 
-        The canonical "conll2003" repo is script-based, which modern
-        `datasets` (>=3) refuses to load ("Dataset scripts are no longer
-        supported"). We try parquet-native mirrors first.
+        The canonical "conll2003" repo (and its eriktks mirror) is
+        script-based, which modern `datasets` (>=3) refuses to load
+        ("Dataset scripts are no longer supported"). Both candidates below
+        were verified on 2026-07-02: identical schema (tokens + int
+        ner_tags, standard tag order) and the real CoNLL-2003 split sizes
+        (14041/3250/3453).
         """
-        candidates = ["eriktks/conll2003", "conll2003"]
+        candidates = [
+            ("eriktks/conll2003", {"revision": "refs/convert/parquet"}),
+            ("tomaarsen/conll2003", {}),
+        ]
         last_err: Optional[Exception] = None
-        for repo in candidates:
+        for repo, extra_kwargs in candidates:
             try:
-                dataset = load_dataset(repo, split=split)
+                dataset = load_dataset(repo, split=split, **extra_kwargs)
                 texts = [format_conll_example(ex) for ex in dataset]
                 texts = [t for t in texts if t.strip()]
 
