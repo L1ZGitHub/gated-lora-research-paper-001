@@ -126,6 +126,8 @@ def build_dataloaders(config: ExperimentConfig, tokenizer) -> Tuple[Any, Any]:
         task_weights=dc.task_weights,
         max_samples_per_task=dc.max_train_samples,
         seed=dc.shuffle_seed,
+        strict=True,  # a task that fails to load must abort, not silently shrink the mix
+        max_eval_samples_per_task=dc.max_val_samples or 1000,
     )
     train_dl = loader.create_weighted_dataloader(
         split="train",

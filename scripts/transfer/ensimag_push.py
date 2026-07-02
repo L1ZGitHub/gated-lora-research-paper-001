@@ -44,7 +44,13 @@ EXCLUDE_FILES = set()  # optimizer.pt MUST go to HF for stage-in resume across j
 # The "latest" checkpoint therefore MUST be pushed to HF so the next job can
 # pull it for resume. But we ALSO keep it locally during the same job for the
 # trainer's in-process resume logic.
-KEEP_LOCAL_AFTER_PUSH = {"checkpoint-LATEST", "latest"}
+#
+# "best_model" belongs here too (2026-07 fix): its CONTENT changes every time
+# a new best eval loss is reached, but the old push-once-then-delete flow
+# marked it in .uploaded after the first push — every subsequent (better!)
+# best_model was then deleted locally WITHOUT being re-uploaded, so HF kept
+# only the first, worst "best".
+KEEP_LOCAL_AFTER_PUSH = {"checkpoint-LATEST", "latest", "best_model"}
 
 
 def parse_args() -> argparse.Namespace:

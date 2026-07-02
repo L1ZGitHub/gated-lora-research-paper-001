@@ -349,11 +349,23 @@ class GatedLoRAModelV2(nn.Module):
                     )
                     self._accumulated_load_balance_loss += lb_loss
 
-                # Accumulate L1 gate regularization (once per layer, only for gated layers)
+                # Accumulate gate sparsity regularization (once per layer, only
+                # for gated layers).
+                #
+                # NOTE (2026-07 fix): the historical formulation
+                # `gate_weights.abs().mean()` was a mathematical NO-OP: gate
+                # weights come out of a softmax (positive, sum to 1 across the
+                # expert dim), so the mean of their absolute values is the
+                # constant 1/num_experts — zero gradient, no learning effect.
+                # The intent of the "L1" penalty was routing SPARSITY; the
+                # correct differentiable surrogate post-softmax is the entropy
+                # of the gate distribution (minimizing it sharpens routing).
+                # Config keys keep their historical names (use_l1_gate_
+                # regularization / l1_gate_weight) so existing YAMLs still work.
                 if self.use_l1_gate_regularization and self.training and use_gating_for_layer:
-                    # L1 = mean of absolute gate weights
-                    l1_loss = gate_weights.abs().mean()
-                    self._accumulated_l1_gate_loss += l1_loss
+                    eps = 1e-10
+                    gate_entropy = -(gate_weights * (gate_weights + eps).log()).sum(dim=-1).mean()
+                    self._accumulated_l1_gate_loss += gate_entropy
             else:
                 gate_weights, gate_logits, routing_info = self._gating_cache[cache_key]
 
@@ -609,6 +621,35 @@ class GatedLoRAModelV2(nn.Module):
 
         logger.info(f"Saved GatedLoRA to {save_directory}")
 
+    def load_adapter_state(self, save_directory: str):
+        """Load expert pools + gating network weights IN PLACE (for resume).
+
+        Unlike ``from_pretrained`` this does not rebuild the model (no base
+        model reload): it restores only the trainable state into the already
+        constructed instance. This is what the trainer needs for cross-job
+        SLURM resume — the previous implementation silently skipped model
+        weights on resume, so chained jobs restarted from fresh adapters
+        while reusing the old optimizer state.
+        """
+        import os
+
+        expert_path = os.path.join(save_directory, "expert_pools.pt")
+        gating_path = os.path.join(save_directory, "gating_network.pt")
+        if not os.path.exists(expert_path) or not os.path.exists(gating_path):
+            raise FileNotFoundError(
+                f"Missing adapter files in {save_directory} "
+                f"(expected expert_pools.pt + gating_network.pt)"
+            )
+
+        expert_states = torch.load(expert_path, map_location=self.device, weights_only=True)
+        for i, pool in enumerate(self.expert_pools):
+            pool.load_state_dict(expert_states[f"layer_{i}"])
+
+        gating_state = torch.load(gating_path, map_location=self.device, weights_only=True)
+        self.gating_network.load_state_dict(gating_state)
+
+        logger.info(f"Loaded adapter state (experts + gating) from {save_directory}")
+
     @classmethod
     def from_pretrained(cls, save_directory: str, config_override: Dict[str, Any] = None, **kwargs):
         """
@@ -626,7 +667,7 @@ class GatedLoRAModelV2(nn.Module):
 
         # Load config from .pt file
         config_path = os.path.join(save_directory, "gated_lora_config.pt")
-        config = torch.load(config_path)
+        config = torch.load(config_path, weights_only=True)
 
         # Try to load additional config from JSON if it exists (for ablations)
         # This allows us to get params that weren't saved in the .pt file
@@ -661,7 +702,7 @@ class GatedLoRAModelV2(nn.Module):
         if "gating_hidden_dim" not in config:
             gating_path = os.path.join(save_directory, "gating_network.pt")
             if os.path.exists(gating_path):
-                gating_state = torch.load(gating_path, map_location="cpu")
+                gating_state = torch.load(gating_path, map_location="cpu", weights_only=True)
                 # Look for the first layer's gate weight to infer hidden dim
                 # Keys are like "gating.layer_gates.0.gate.0.weight" with shape [gating_hidden_dim, input_dim]
                 for key in gating_state:
@@ -692,12 +733,12 @@ class GatedLoRAModelV2(nn.Module):
         model = cls(**filtered_config)
 
         # Load expert pools
-        expert_states = torch.load(os.path.join(save_directory, "expert_pools.pt"))
+        expert_states = torch.load(os.path.join(save_directory, "expert_pools.pt"), weights_only=True)
         for i, pool in enumerate(model.expert_pools):
             pool.load_state_dict(expert_states[f"layer_{i}"])
 
         # Load gating network (with strict=False to handle missing keys gracefully)
-        gating_state = torch.load(os.path.join(save_directory, "gating_network.pt"))
+        gating_state = torch.load(os.path.join(save_directory, "gating_network.pt"), weights_only=True)
         try:
             model.gating_network.load_state_dict(gating_state, strict=True)
         except RuntimeError as e:

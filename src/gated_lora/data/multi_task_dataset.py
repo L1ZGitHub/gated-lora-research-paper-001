@@ -71,10 +71,17 @@ class TaskDataset(Dataset):
         input_ids = encoding["input_ids"].squeeze(0)
         attention_mask = encoding["attention_mask"].squeeze(0)
 
+        # Causal LM labels: mask padding positions with -100 so the loss is
+        # not computed on pad tokens (pad_token == eos_token for Phi-2 & co,
+        # so without this the model is trained to spam EOS after the answer
+        # and perplexity numbers are polluted by trivial pad predictions).
+        labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "labels": input_ids.clone(),  # For causal LM
+            "labels": labels,
             "task": self.task_name,
         }
 
@@ -279,12 +286,20 @@ class MultiTaskDatasetLoader:
         task_weights: List[float] = None,
         max_samples_per_task: Optional[int] = None,
         seed: int = 42,
+        strict: bool = True,
+        max_eval_samples_per_task: int = 1000,
     ):
         if not DATASETS_AVAILABLE:
             raise ImportError("datasets library required: pip install datasets")
 
         self.tokenizer = tokenizer
         self.max_length = max_length
+        # strict=True: a task that fails to load ABORTS the run instead of
+        # being silently dropped. Silent dropping is doubly wrong: (a) the
+        # experiment no longer trains on the advertised task mix, and (b) the
+        # task_weights list gets misaligned with the surviving tasks.
+        self.strict = strict
+        self.max_eval_samples_per_task = max_eval_samples_per_task
 
         # Default: all 8 tasks
         self.task_datasets = task_datasets or [
@@ -347,20 +362,30 @@ class MultiTaskDatasetLoader:
             return []
 
     def _load_conll(self, split: str = "train") -> List[str]:
-        """Load CoNLL-2003 dataset."""
-        try:
-            dataset = load_dataset("conll2003", split=split, trust_remote_code=True)
-            texts = [format_conll_example(ex) for ex in dataset]
-            texts = [t for t in texts if t.strip()]
+        """Load CoNLL-2003 dataset.
 
-            if self.max_samples_per_task:
-                texts = texts[:self.max_samples_per_task]
+        The canonical "conll2003" repo is script-based, which modern
+        `datasets` (>=3) refuses to load ("Dataset scripts are no longer
+        supported"). We try parquet-native mirrors first.
+        """
+        candidates = ["eriktks/conll2003", "conll2003"]
+        last_err: Optional[Exception] = None
+        for repo in candidates:
+            try:
+                dataset = load_dataset(repo, split=split)
+                texts = [format_conll_example(ex) for ex in dataset]
+                texts = [t for t in texts if t.strip()]
 
-            logger.info(f"Loaded {len(texts)} CoNLL-2003 examples")
-            return texts
-        except Exception as e:
-            logger.warning(f"Failed to load CoNLL-2003: {e}")
-            return []
+                if self.max_samples_per_task:
+                    texts = texts[:self.max_samples_per_task]
+
+                logger.info(f"Loaded {len(texts)} CoNLL-2003 examples (from {repo})")
+                return texts
+            except Exception as e:
+                last_err = e
+                logger.warning(f"CoNLL-2003 load failed from {repo}: {e}")
+        logger.warning(f"Failed to load CoNLL-2003 from all sources: {last_err}")
+        return []
 
     def _load_wikitext(self, split: str = "train") -> List[str]:
         """Load WikiText-2 dataset."""
@@ -387,7 +412,7 @@ class MultiTaskDatasetLoader:
         try:
             # GSM8K has train and test splits
             actual_split = "train" if split == "train" else "test"
-            dataset = load_dataset("gsm8k", "main", split=actual_split, trust_remote_code=True)
+            dataset = load_dataset("gsm8k", "main", split=actual_split)
             texts = [format_gsm8k_example(ex) for ex in dataset]
             texts = [t for t in texts if t.strip()]
 
@@ -403,7 +428,7 @@ class MultiTaskDatasetLoader:
     def _load_xsum(self, split: str = "train") -> List[str]:
         """Load XSum summarization dataset."""
         try:
-            dataset = load_dataset("xsum", split=split, trust_remote_code=True)
+            dataset = load_dataset("EdinburghNLP/xsum", split=split)
             texts = [format_xsum_example(ex) for ex in dataset]
             texts = [t for t in texts if t.strip()]
 
@@ -421,7 +446,7 @@ class MultiTaskDatasetLoader:
         try:
             # CommonsenseQA has train, validation splits (test has no labels)
             actual_split = split if split in ["train", "validation"] else "validation"
-            dataset = load_dataset("commonsense_qa", split=actual_split, trust_remote_code=True)
+            dataset = load_dataset("commonsense_qa", split=actual_split)
             texts = [format_commonsenseqa_example(ex) for ex in dataset]
             texts = [t for t in texts if t.strip()]
 
@@ -445,7 +470,7 @@ class MultiTaskDatasetLoader:
             else:
                 actual_split = "train"
 
-            dataset = load_dataset("glue", "mnli", split=actual_split, trust_remote_code=True)
+            dataset = load_dataset("glue", "mnli", split=actual_split)
             texts = [format_mnli_example(ex) for ex in dataset]
             texts = [t for t in texts if t.strip()]
 
@@ -479,10 +504,19 @@ class MultiTaskDatasetLoader:
         }
 
         if task_name.lower() not in loaders:
+            if self.strict:
+                raise ValueError(f"Unknown task: {task_name}")
             logger.warning(f"Unknown task: {task_name}")
             return []
 
-        return loaders[task_name.lower()](split)
+        texts = loaders[task_name.lower()](split)
+        if not texts and self.strict:
+            raise RuntimeError(
+                f"Task '{task_name}' (split={split}) loaded 0 examples. "
+                f"Refusing to continue: the experiment would silently train on "
+                f"fewer tasks than configured. Fix the loader or remove the task."
+            )
+        return texts
 
     def create_dataset(self, split: str = "train") -> Dataset:
         """
@@ -527,8 +561,9 @@ class MultiTaskDatasetLoader:
         """
         datasets = []
         task_sizes = []
+        loaded_weights = []  # weights aligned with SUCCESSFULLY loaded tasks
 
-        for task_name in self.task_datasets:
+        for task_idx, task_name in enumerate(self.task_datasets):
             texts = self.load_task(task_name, split)
 
             if texts:
@@ -540,6 +575,10 @@ class MultiTaskDatasetLoader:
                 )
                 datasets.append(task_dataset)
                 task_sizes.append(len(texts))
+                # Index into the ORIGINAL weight list: if a task fails to load
+                # (strict=False), zipping sizes with the full weight list would
+                # silently shift every subsequent task onto the wrong weight.
+                loaded_weights.append(self.task_weights[task_idx])
 
         if not datasets:
             raise ValueError("No datasets could be loaded!")
@@ -548,9 +587,8 @@ class MultiTaskDatasetLoader:
 
         # Create sample weights for weighted random sampling
         sample_weights = []
-        cumulative_size = 0
 
-        for task_idx, (task_size, task_weight) in enumerate(zip(task_sizes, self.task_weights)):
+        for task_size, task_weight in zip(task_sizes, loaded_weights):
             # Weight per sample in this task
             weight_per_sample = task_weight / task_size
             sample_weights.extend([weight_per_sample] * task_size)
@@ -633,7 +671,7 @@ class MultiTaskDatasetLoader:
 
             # Limit eval samples
             if texts:
-                texts = texts[:1000]  # Cap eval samples per task
+                texts = texts[:self.max_eval_samples_per_task]
                 task_dataset = TaskDataset(
                     texts=texts,
                     tokenizer=self.tokenizer,

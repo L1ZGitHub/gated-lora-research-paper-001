@@ -68,10 +68,12 @@ def dict_to_experiment_config(cfg: Dict[str, Any]) -> ExperimentConfig:
     if "weights" in data_block:
         data_block["task_weights"] = data_block.pop("weights")
     if "max_samples_per_task" in data_block:
-        # Apply globally; legacy uses separate train/val caps.
+        # Train cap; only mirror onto the val cap when the YAML doesn't set
+        # max_val_samples explicitly (a 5000/task TRAIN cap must not force a
+        # 5000/task EVAL — that's a 2-4h evaluation inside a 4h SLURM job).
         cap = data_block.pop("max_samples_per_task")
         data_block["max_train_samples"] = cap
-        data_block["max_val_samples"] = cap
+        data_block.setdefault("max_val_samples", cap)
     if "shuffle" in data_block:
         # Legacy doesn't have a "shuffle" toggle — `shuffle_seed` controls reshuffling.
         data_block.pop("shuffle")

@@ -372,7 +372,7 @@ class RoutingVisualizer:
         num_layers, num_experts = layer_usage.shape
 
         if expert_names is None:
-            expert_names = [f"Expert {i}\n(r={[8, 16, 32][i % 3]})" for i in range(num_experts)]
+            expert_names = [f"Expert {i}" for i in range(num_experts)]
 
         fig, ax = plt.subplots(figsize=(10, 14))
 
@@ -409,6 +409,7 @@ class RoutingVisualizer:
         entropy: np.ndarray,
         title: str = "Routing Entropy per Layer",
         filename: str = "entropy_per_layer.png",
+        num_experts: int = 3,
     ):
         """
         Plot routing entropy across layers.
@@ -417,6 +418,7 @@ class RoutingVisualizer:
             entropy: [num_layers] array
             title: Plot title
             filename: Output filename
+            num_experts: expert count, used for the max-entropy reference line
         """
         if not MATPLOTLIB_AVAILABLE:
             return
@@ -433,8 +435,10 @@ class RoutingVisualizer:
         ax.set_title(title)
         ax.legend()
 
-        # Add max entropy reference line
-        max_entropy = np.log(len(entropy))  # Approximation
+        # Add max entropy reference line.
+        # Upper bound of routing entropy = log(num_experts): uniform routing
+        # across experts. (Was log(num_layers) — wrong reference line.)
+        max_entropy = np.log(max(num_experts, 2))
         ax.axhline(y=max_entropy, color="gray", linestyle=":", alpha=0.5, label="Max Entropy")
 
         plt.tight_layout()
@@ -635,9 +639,13 @@ class RoutingVisualizer:
             logger.warning("matplotlib not available - skipping visualization report")
             return
 
-        # Expert names based on ranks
-        expert_names = [f"Expert {i}\n(r={[8, 16, 32][i % analyzer.num_experts]})"
-                       for i in range(analyzer.num_experts)]
+        # Expert names based on the ACTUAL configured ranks when available
+        # (was hardcoded [8, 16, 32] — wrong labels for e.g. 2-expert runs).
+        ranks = getattr(analyzer, "expert_ranks", None)
+        if ranks and len(ranks) == analyzer.num_experts:
+            expert_names = [f"Expert {i}\n(r={ranks[i]})" for i in range(analyzer.num_experts)]
+        else:
+            expert_names = [f"Expert {i}" for i in range(analyzer.num_experts)]
 
         # 1. Layer-expert heatmap
         layer_usage = analyzer.get_layer_expert_usage()
@@ -654,6 +662,7 @@ class RoutingVisualizer:
             entropy,
             title=f"{experiment_name}: Routing Entropy per Layer",
             filename=f"{experiment_name}_entropy_per_layer.png",
+            num_experts=analyzer.num_experts,
         )
 
         # 3. Task-expert usage (if available)

@@ -40,8 +40,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Default max runtime: 3h30 (leaving 30min margin for 4h SLURM limit)
-DEFAULT_MAX_RUNTIME_SECONDS = 3.5 * 3600  # 12600 seconds
+# Default max runtime: 3h30 (leaving 30min margin for 4h SLURM limit).
+# Override per-job with env GLR_MAX_RUNTIME_SECONDS (set by train.sbatch)
+# so partitions with different MaxTime don't need a code change.
+DEFAULT_MAX_RUNTIME_SECONDS = float(
+    os.environ.get("GLR_MAX_RUNTIME_SECONDS", 3.5 * 3600)
+)
 
 
 def setup_logging_to_stdout():
@@ -770,8 +774,15 @@ class GatedLoRATrainer:
                         if WANDB_AVAILABLE and wandb.run is not None:
                             wandb.log(log_dict, step=self.state.global_step)
 
-                    # Evaluation
-                    if self.state.global_step % self.eval_steps == 0 and self.eval_dataloader is not None:
+                    # Evaluation — skipped when close to the runtime budget:
+                    # a full eval can take 15-30 min, and overshooting the
+                    # SLURM wall means SIGKILL with no "latest" checkpoint.
+                    eval_time_ok = (
+                        time.time() - start_time
+                    ) < self.max_runtime_seconds - 20 * 60
+                    if (self.state.global_step % self.eval_steps == 0
+                            and self.eval_dataloader is not None
+                            and eval_time_ok):
                         eval_metrics = self.evaluate()
                         logger.info(f"Eval at step {self.state.global_step}: {eval_metrics}")
 
@@ -828,8 +839,9 @@ class GatedLoRATrainer:
             # End of epoch - reset batch_idx for next epoch
             self.state.batch_idx = 0
 
-            # End of epoch evaluation
-            eval_metrics = self.evaluate() if self.eval_dataloader else {}
+            # End of epoch evaluation (same runtime guard as step-based eval)
+            eval_time_ok = (time.time() - start_time) < self.max_runtime_seconds - 20 * 60
+            eval_metrics = self.evaluate() if (self.eval_dataloader and eval_time_ok) else {}
             epoch_avg_loss = epoch_loss / max(epoch_steps, 1)
 
             logger.info(f"Epoch {epoch + 1} completed: avg_loss={epoch_avg_loss:.4f}")
@@ -966,17 +978,53 @@ class GatedLoRATrainer:
             logger.warning(f"post-save push skipped ({type(exc).__name__}): {exc}")
 
     def load_checkpoint(self, path: str):
-        """Load model checkpoint."""
+        """Load model checkpoint.
+
+        NOTE (2026-07 fix): the historical implementation restored optimizer/
+        scheduler/training-state but silently SKIPPED the model weights for
+        any model saved via ``save_pretrained`` (GatedLoRAModelV2 and PEFT
+        baselines both are). Cross-job SLURM resume therefore restarted the
+        adapters from scratch while reusing a stale optimizer state. This now
+        loads the weights explicitly for both model families and refuses to
+        resume when it cannot.
+        """
         checkpoint_dir = Path(path)
 
         # Load model state
         if (checkpoint_dir / "model.pt").exists():
-            state_dict = torch.load(checkpoint_dir / "model.pt", map_location=self.device)
+            state_dict = torch.load(
+                checkpoint_dir / "model.pt", map_location=self.device, weights_only=True
+            )
             self.model.load_state_dict(state_dict)
             logger.info(f"Loaded model from {checkpoint_dir / 'model.pt'}")
-        elif hasattr(self.model, "load_pretrained"):
-            # For HF models - they save differently
-            pass
+        elif hasattr(self.model, "load_adapter_state"):
+            # GatedLoRAModelV2: restore experts + gating in place
+            self.model.load_adapter_state(str(checkpoint_dir))
+        elif (checkpoint_dir / "adapter_model.safetensors").exists() or (
+            checkpoint_dir / "adapter_model.bin"
+        ).exists():
+            # PEFT baseline LoRA: restore adapter weights in place
+            from peft.utils import set_peft_model_state_dict
+
+            st_path = checkpoint_dir / "adapter_model.safetensors"
+            if st_path.exists():
+                from safetensors.torch import load_file
+
+                adapter_state = load_file(str(st_path), device=str(self.device))
+            else:
+                adapter_state = torch.load(
+                    checkpoint_dir / "adapter_model.bin",
+                    map_location=self.device,
+                    weights_only=True,
+                )
+            set_peft_model_state_dict(self.model, adapter_state)
+            logger.info(f"Loaded PEFT adapter weights from {checkpoint_dir}")
+        else:
+            raise FileNotFoundError(
+                f"Cannot resume: no loadable model weights found in {checkpoint_dir} "
+                f"(looked for model.pt / expert_pools.pt+gating_network.pt / adapter_model.*). "
+                f"Resuming without weights would silently restart training."
+            )
 
         # Load optimizer state
         if (checkpoint_dir / "optimizer.pt").exists():
