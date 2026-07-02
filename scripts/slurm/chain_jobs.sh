@@ -10,7 +10,12 @@
 #       --seed 42 \
 #       [--max-jobs 10] \
 #       [--partition rtx6000] \
+#       [--nodelist turing-[4-9]] \
 #       [--run-name <override>]
+#
+# GPU-footprint policy: each slice asks for 1 GPU; the default nodelist pins
+# rtx6000 jobs to 6 of the 9 turing nodes (leave 3 for other students). The
+# CONCURRENCY cap (how many chains run at once) lives in launch_queue.sh.
 #
 # Exit codes: 0 done, 1 bad args, 2 budget exhausted.
 
@@ -20,6 +25,7 @@ CONFIG=""
 SEED=""
 MAX_JOBS=10
 PARTITION="rtx6000"
+NODELIST=""            # empty = partition default below
 RUN_NAME=""
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HF_REPO="${GLR_HF_REPO:-Helain/gated-lora-experiments}"
@@ -30,6 +36,7 @@ while [[ $# -gt 0 ]]; do
         --seed)       SEED="$2"; shift 2 ;;
         --max-jobs)   MAX_JOBS="$2"; shift 2 ;;
         --partition)  PARTITION="$2"; shift 2 ;;
+        --nodelist)   NODELIST="$2"; shift 2 ;;
         --run-name)   RUN_NAME="$2"; shift 2 ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
@@ -51,6 +58,13 @@ fi
 if [[ -z "$RUN_NAME" ]]; then
     config_basename=$(basename "$CONFIG" .yaml)
     RUN_NAME="${config_basename}_seed${SEED}"
+fi
+
+# Default nodelist per partition:
+#   rtx6000 → restrict to 6 of 9 turing nodes (agreement: leave GPUs for others)
+#   a40/v100 → single node each, let SLURM place the job
+if [[ -z "$NODELIST" && "$PARTITION" == "rtx6000" ]]; then
+    NODELIST="turing-[4-9]"
 fi
 
 # Pick the right Python — prefer the project venv if it exists, else system.
@@ -76,6 +90,7 @@ echo "  Seed:      $SEED"
 echo "  Run name:  $RUN_NAME"
 echo "  HF repo:   $HF_REPO"
 echo "  Partition: $PARTITION"
+echo "  Nodelist:  ${NODELIST:-<slurm default>}"
 echo "  Max jobs:  $MAX_JOBS"
 echo "  Python:    $PY"
 echo "==================================================================="
@@ -102,27 +117,32 @@ for ((i=1; i<=MAX_JOBS; i++)); do
     fi
 
     echo "[chain] Submitting job $i / $MAX_JOBS at $(date -Iseconds)"
-    # Partition-specific nodelist:
-    #   rtx6000 = restrict to 6 of 9 turing nodes (per agreement with the user)
-    #   a40     = only the "ampere" node exists, let SLURM pick automatically
     NODELIST_ARG=()
-    case "$PARTITION" in
-        rtx6000) NODELIST_ARG=(--nodelist=turing-[4-9]) ;;
-    esac
-    job_output=$(sbatch \
+    if [[ -n "$NODELIST" ]]; then
+        NODELIST_ARG=(--nodelist="$NODELIST")
+    fi
+    job_id=$(sbatch --parsable \
         --partition="$PARTITION" \
         "${NODELIST_ARG[@]}" \
-        --export=ALL,GLR_CONFIG="$CONFIG",GLR_SEED="$SEED",GLR_RUN_NAME="$RUN_NAME",HF_TOKEN="$HF_TOKEN",GLR_HF_REPO="$HF_REPO",GLR_RESUME="auto" \
+        --export=ALL,GLR_CONFIG="$CONFIG",GLR_SEED="$SEED",GLR_RUN_NAME="$RUN_NAME",HF_TOKEN="$HF_TOKEN",GLR_HF_REPO="$HF_REPO",GLR_RESUME="auto",GLR_CODE_MODE="${GLR_CODE_MODE:-home}",GLR_MAX_RUNTIME_SECONDS="${GLR_MAX_RUNTIME_SECONDS:-12600}" \
         "${PROJECT_ROOT}/scripts/slurm/train.sbatch")
 
-    job_id=$(echo "$job_output" | grep -oP '\d+$')
-    if [[ -z "$job_id" ]]; then
-        echo "[chain] ERROR: could not parse job id from: $job_output" >&2
+    if [[ -z "$job_id" || ! "$job_id" =~ ^[0-9]+$ ]]; then
+        echo "[chain] ERROR: could not parse job id from sbatch output: '$job_id'" >&2
         exit 1
     fi
     echo "[chain] Submitted job $job_id, polling..."
 
-    while squeue -j "$job_id" -h 2>/dev/null | grep -q "^"; do
+    # Poll until the job leaves the queue. A transient squeue failure must
+    # NOT be read as "job finished" — require 3 consecutive empty/failed
+    # polls before moving on.
+    empty_polls=0
+    while (( empty_polls < 3 )); do
+        if squeue -j "$job_id" -h 2>/dev/null | grep -q "^"; then
+            empty_polls=0
+        else
+            empty_polls=$((empty_polls + 1))
+        fi
         sleep 60
     done
     echo "[chain] Job $job_id left the queue at $(date -Iseconds)"
