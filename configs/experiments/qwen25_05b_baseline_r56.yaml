@@ -1,0 +1,25 @@
+# Baseline — plain LoRA, EXPERT-capacity-matched vs the gated qwen25_05b model.
+# Matches only the summed expert ranks (r = 8+16+32 = 56); the gated model
+# gets its gating networks "for free". Complements the total-matched baseline
+# (isolates the routing contribution from raw adaptation capacity).
+extends:
+  - models/qwen25_05b.yaml
+  - tasks/all_8.yaml
+
+experiment_name: qwen25_05b_baseline_r56
+description: |
+  Plain (non-gated) LoRA baseline, 8-task mix, matching the summed expert
+  ranks of the gated model (r = 8+16+32 = 56).
+
+model:
+  model_type: baseline
+  lora_r: 56
+  lora_alpha: 112
+
+training:
+  num_epochs: 4
+
+output:
+  output_dir: ./outputs/qwen25_05b_baseline_r56
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: qwen25_05b_baseline_r56

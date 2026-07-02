@@ -24,14 +24,26 @@ configs/experiments/phi2_baseline_r56.yaml 42
 # configs/experiments/phi2_baseline_r56.yaml 1337 2024
 
 # === Phase 3: Architecture sweep (1 seed each, rtx6000-sized) ===
+# Each gated run is paired with its TOTAL-param-matched baseline (rNN computed
+# per model — see the baseline YAML headers) + the expert-matched r56 variant.
 # configs/experiments/pythia410m_all_8.yaml 42
+# configs/experiments/pythia410m_baseline_r74.yaml 42
+# configs/experiments/pythia410m_baseline_r56.yaml 42
 # configs/experiments/qwen25_05b_all_8.yaml 42
+# configs/experiments/qwen25_05b_baseline_r67.yaml 42
+# configs/experiments/qwen25_05b_baseline_r56.yaml 42
 # configs/experiments/smollm360m_all_8.yaml 42
+# configs/experiments/smollm360m_baseline_r72.yaml 42
+# configs/experiments/smollm360m_baseline_r56.yaml 42
 
 # === Phase 4: Larger models (a40 partition; HF auth for gated repos) ===
 # NOTE: pass --partition a40 to launch_queue.sh for these.
 # configs/experiments/gemma2_all_8.yaml 42
+# configs/experiments/gemma2_baseline_r69.yaml 42
+# configs/experiments/gemma2_baseline_r56.yaml 42
 # configs/experiments/llama32_all_8.yaml 42
+# configs/experiments/llama32_baseline_r72.yaml 42
+# configs/experiments/llama32_baseline_r56.yaml 42
 
 # === Phase 5: Ablations on Phi-2 ===
 # configs/experiments/phi2_ablation_no_l1.yaml 42 1337 2024

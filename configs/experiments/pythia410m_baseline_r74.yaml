@@ -1,0 +1,30 @@
+# Baseline — plain LoRA, TOTAL-param-matched vs the gated pythia410m model.
+# Same trainable budget as gated (experts + gating nets): any gated gain must
+# survive this baseline, otherwise it is just extra capacity.
+#
+#   gated trainable total : 28,926,024 params
+#   plain LoRA r=74        : 29,097,984 params  (delta +0.59%)
+# Computed on nash 2026-07-02 with the real classes:
+#   python scripts/analysis/param_match.py --model <hf_name> --target-modules ...
+# alpha keeps the alpha/r = 2 convention of the experts.
+extends:
+  - models/pythia410m.yaml
+  - tasks/all_8.yaml
+
+experiment_name: pythia410m_baseline_r74
+description: |
+  Plain (non-gated) LoRA baseline, 8-task mix, matching the gated model's
+  TOTAL trainable-parameter budget (experts + gating networks).
+
+model:
+  model_type: baseline
+  lora_r: 74
+  lora_alpha: 148
+
+training:
+  num_epochs: 4
+
+output:
+  output_dir: ./outputs/pythia410m_baseline_r74
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: pythia410m_baseline_r74

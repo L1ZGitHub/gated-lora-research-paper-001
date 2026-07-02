@@ -1,0 +1,30 @@
+# Baseline — plain LoRA, TOTAL-param-matched vs the gated qwen25_05b model.
+# Same trainable budget as gated (experts + gating nets): any gated gain must
+# survive this baseline, otherwise it is just extra capacity.
+#
+#   gated trainable total : 36,839,496 params
+#   plain LoRA r=67        : 36,842,496 params  (delta +0.01%)
+# Computed on nash 2026-07-02 with the real classes:
+#   python scripts/analysis/param_match.py --model <hf_name> --target-modules ...
+# alpha keeps the alpha/r = 2 convention of the experts.
+extends:
+  - models/qwen25_05b.yaml
+  - tasks/all_8.yaml
+
+experiment_name: qwen25_05b_baseline_r67
+description: |
+  Plain (non-gated) LoRA baseline, 8-task mix, matching the gated model's
+  TOTAL trainable-parameter budget (experts + gating networks).
+
+model:
+  model_type: baseline
+  lora_r: 67
+  lora_alpha: 134
+
+training:
+  num_epochs: 4
+
+output:
+  output_dir: ./outputs/qwen25_05b_baseline_r67
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: qwen25_05b_baseline_r67
