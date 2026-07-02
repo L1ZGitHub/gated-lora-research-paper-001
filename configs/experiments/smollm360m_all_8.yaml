@@ -1,0 +1,18 @@
+# SmolLM-360M gated × 8 tasks (smallest model of the sweep, rtx6000-sized).
+# Referenced by experiments/queue.txt Phase 3 — file was missing until 2026-07.
+extends:
+  - models/smollm360m.yaml
+  - tasks/all_8.yaml
+
+experiment_name: smollm360m_all_8
+description: |
+  SmolLM-360M with gated LoRA trained on the 8-task mix.
+  Smallest-model datapoint for the scaling comparison (0.36B → 2.7B).
+
+training:
+  num_epochs: 4
+
+output:
+  output_dir: ./outputs/smollm360m_all_8
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: smollm360m_all_8

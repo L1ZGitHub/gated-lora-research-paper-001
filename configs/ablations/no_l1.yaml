@@ -1,8 +1,13 @@
-# Ablation: disable L1 regularization on gate weights.
-# Tests whether sparsity-inducing L1 penalty is necessary.
+# Ablation: disable the gate-sparsity regularization.
+#
+# NOTE (2026-07): the penalty behind use_l1_gate_regularization was fixed —
+# the historical "L1 on softmax weights" was a mathematical no-op (constant
+# 1/num_experts, zero gradient), so pre-fix runs of this ablation compared
+# noise. It is now the entropy of the gate distribution (sharper routing).
+# The config key keeps its historical name for compatibility.
 ablation:
   name: no_l1
-  description: "L1 regularization on gate weights disabled"
+  description: "Gate-sparsity (entropy) regularization disabled"
 overrides:
   model:
     use_l1_gate_regularization: false

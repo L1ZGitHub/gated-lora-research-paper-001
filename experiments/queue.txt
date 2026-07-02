@@ -1,27 +1,37 @@
 # Experiments to run (in order). Lines starting with # are comments.
 # Format: <config_path> <seed1> [<seed2> ...]
 #
+# Launch with:  bash scripts/slurm/launch_queue.sh --dry-run   (plan only)
+#               nohup bash scripts/slurm/launch_queue.sh >> logs/launch_queue.log 2>&1 &
+#
 # The supervisor reads this to differentiate "no runs because the user
 # hasn't started" (idle, info-only) from "no runs because something broke"
 # (warn).
 
-# === Smoke (PASSED 2026-05-23 — pipeline validated end-to-end) ===
+# === Smoke (re-validate pipeline after 2026-07 fixes, ~15 min) ===
 # configs/experiments/smoke_phi2.yaml 0
 
-# === Phase 1: Phi-2 baseline (paper datapoint #1) ===
+# === Phase 1: THE paper comparison — gated vs param-matched baselines ===
+# Same tasks, same data caps, same training budget; only the adapter differs.
+# r72 = total-param-matched (harshest), r56 = expert-capacity-matched.
 configs/experiments/phi2_harder_multitask.yaml 42
+configs/experiments/phi2_baseline_r72.yaml 42
+configs/experiments/phi2_baseline_r56.yaml 42
 
-# === Phase 2: Phi-2 multi-seed (paper figures) ===
+# === Phase 2: Phi-2 multi-seed (paper figures need >= 3 seeds) ===
 # configs/experiments/phi2_harder_multitask.yaml 1337 2024
+# configs/experiments/phi2_baseline_r72.yaml 1337 2024
+# configs/experiments/phi2_baseline_r56.yaml 1337 2024
 
-# === Phase 3: Architecture sweep (1 seed each) ===
+# === Phase 3: Architecture sweep (1 seed each, rtx6000-sized) ===
 # configs/experiments/pythia410m_all_8.yaml 42
-# configs/experiments/qwen25_05b.yaml 42
-# configs/experiments/smollm360m.yaml 42
+# configs/experiments/qwen25_05b_all_8.yaml 42
+# configs/experiments/smollm360m_all_8.yaml 42
 
-# === Phase 4: Larger models (requires HF auth for gated) ===
+# === Phase 4: Larger models (a40 partition; HF auth for gated repos) ===
+# NOTE: pass --partition a40 to launch_queue.sh for these.
 # configs/experiments/gemma2_all_8.yaml 42
-# configs/experiments/llama32.yaml 42
+# configs/experiments/llama32_all_8.yaml 42
 
 # === Phase 5: Ablations on Phi-2 ===
 # configs/experiments/phi2_ablation_no_l1.yaml 42 1337 2024

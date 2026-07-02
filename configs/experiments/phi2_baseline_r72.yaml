@@ -1,0 +1,41 @@
+# Baseline #1 — plain LoRA, TOTAL-param-matched vs the gated model.
+#
+# THE key comparison of the paper: any gated-vs-baseline gain must survive
+# a baseline with the SAME trainable-parameter budget, otherwise the gain
+# is just extra capacity.
+#
+# Budget accounting for Phi-2 (hidden=2560, 32 layers,
+# modules q/k/v/dense/fc1/fc2, Σ(in+out)=46080 per layer):
+#   gated experts (Σr=8+16+32=56): 56 × 46080 × 32 = 82,575,360
+#   gating nets (per-layer MLP 2560→256→3 + layer-emb 32×2560):
+#     (81920 + 655616 + 771) × 32               = 23,625,824
+#   gated TOTAL trainable                        ≈ 106,201,184
+#   plain LoRA r: r × 46080 × 32 = 1,474,560 r
+#   → r = 72 gives 106,168,320 (Δ −0.03% vs gated)
+# Verify with: python scripts/analysis/param_match.py --model microsoft/phi-2
+#
+# alpha keeps the α/r = 2 convention used by the experts (16/8, 32/16, 64/32).
+extends:
+  - models/phi2.yaml
+  - tasks/all_8.yaml
+
+experiment_name: phi2_baseline_r72
+description: |
+  Plain (non-gated) LoRA baseline on Phi-2, 8-task mix, with the SAME total
+  trainable-parameter budget as the gated model (experts + gating networks).
+
+model:
+  model_type: baseline
+  lora_r: 72
+  lora_alpha: 144
+
+training:
+  num_epochs: 4
+
+data:
+  max_samples_per_task: 5000  # identical cap to the gated runs (legacy scale)
+
+output:
+  output_dir: ./outputs/phi2_baseline_r72
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: phi2_baseline_r72

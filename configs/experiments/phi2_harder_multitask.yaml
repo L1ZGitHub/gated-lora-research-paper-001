@@ -13,6 +13,9 @@ description: |
 training:
   num_epochs: 4
 
+## data.max_samples_per_task is set once in tasks/all_8.yaml (5000/task,
+## legacy scale) so gated, baselines and ablations all share the same cap.
+
 # Output paths
 output:
   output_dir: ./outputs/phi2_harder_multitask

@@ -1,0 +1,19 @@
+# Llama-3.2-3B gated × 8 tasks (largest model of the sweep, a40, HF auth).
+# Referenced by experiments/queue.txt Phase 4 — file was missing until 2026-07.
+extends:
+  - models/llama32.yaml
+  - tasks/all_8.yaml
+
+experiment_name: llama32_all_8
+description: |
+  Llama-3.2-3B with gated LoRA trained on the 8-task mix.
+  Largest-model datapoint for the scaling comparison. Gated HF repo —
+  requires an HF_TOKEN with access to meta-llama/Llama-3.2-3B.
+
+training:
+  num_epochs: 4
+
+output:
+  output_dir: ./outputs/llama32_all_8
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: llama32_all_8

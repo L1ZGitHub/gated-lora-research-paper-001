@@ -1,0 +1,18 @@
+# Qwen2.5-0.5B gated × 8 tasks (GQA architecture, rtx6000-sized).
+# Referenced by experiments/queue.txt Phase 3 — file was missing until 2026-07.
+extends:
+  - models/qwen25_05b.yaml
+  - tasks/all_8.yaml
+
+experiment_name: qwen25_05b_all_8
+description: |
+  Qwen2.5-0.5B with gated LoRA trained on the 8-task mix.
+  Small-model datapoint for the scaling comparison (0.36B → 2.7B).
+
+training:
+  num_epochs: 4
+
+output:
+  output_dir: ./outputs/qwen25_05b_all_8
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: qwen25_05b_all_8

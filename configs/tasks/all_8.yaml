@@ -2,5 +2,13 @@
 data:
   tasks: [squad, imdb, conll2003, wikitext, gsm8k, xsum, commonsenseqa, mnli]
   weights: [0.12, 0.10, 0.12, 0.10, 0.15, 0.14, 0.14, 0.13]
-  max_samples_per_task: null
+  # Cap matching the legacy ensicompute_harder_multitask runs. Without it the
+  # 8-task mix is ~750k samples/epoch (xsum 204k + mnli 393k + ...) — hundreds
+  # of GPU-hours per epoch. Shared here so gated runs, baselines and ablations
+  # all train on the SAME data budget (comparability requirement).
+  max_samples_per_task: 5000
+  # Eval cap per task: 500 x 8 tasks = 4000 samples, 10-25 min per eval at
+  # bs=8 - fits inside the 30-min end-of-job margin (the trainer additionally
+  # skips evals when close to the runtime budget).
+  max_val_samples: 500
   shuffle: true
