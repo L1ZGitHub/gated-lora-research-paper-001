@@ -178,11 +178,16 @@ submit() {
     local -a args=(--parsable --partition="$PARTITION" --job-name="$RUN_NAME")
     ex=$(exclude_arg); [[ -n "$ex" ]] && args+=("$ex")
     [[ -n "$dep" ]] && args+=(--dependency="afterany:$dep")
-    args+=(--export="ALL,GLR_CONFIG=$CONFIG,GLR_SEED=$SEED,GLR_RUN_NAME=$RUN_NAME,GLR_HF_REPO=$HF_REPO,GLR_RESUME=auto,GLR_CODE_MODE=${GLR_CODE_MODE:-home},GLR_REPO_DIR=$PROJECT_ROOT")
+    # Job variables go through the submit environment (sbatch exports ALL by default), NOT
+    # --export=ALL,VAR=...: on ensicompute (2026-10-07) any --export=ALL,VAR=... job is
+    # requeued + held with "user_env_retrieval_failed".
+    local -a jobenv=(GLR_CONFIG="$CONFIG" GLR_SEED="$SEED" GLR_RUN_NAME="$RUN_NAME"
+                     GLR_HF_REPO="$HF_REPO" GLR_RESUME=auto
+                     GLR_CODE_MODE="${GLR_CODE_MODE:-home}" GLR_REPO_DIR="$PROJECT_ROOT")
     if [[ "${GLR_TOKEN_VIA_ENV:-0}" == "1" ]]; then
-        out=$(cd "$PROJECT_ROOT" && HF_TOKEN="$TOKEN" sbatch "${args[@]}" scripts/slurm/train.sbatch)
+        out=$(cd "$PROJECT_ROOT" && env "${jobenv[@]}" HF_TOKEN="$TOKEN" sbatch "${args[@]}" scripts/slurm/train.sbatch)
     else
-        out=$(cd "$PROJECT_ROOT" && env -u HF_TOKEN sbatch "${args[@]}" scripts/slurm/train.sbatch)
+        out=$(cd "$PROJECT_ROOT" && env -u HF_TOKEN "${jobenv[@]}" sbatch "${args[@]}" scripts/slurm/train.sbatch)
     fi
     out="${out%%;*}"
     [[ "$out" =~ ^[0-9]+$ ]] || { echo "ERROR: cannot parse sbatch output: $out" >&2; return 1; }

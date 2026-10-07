@@ -182,6 +182,8 @@ class _HubPusher:
     """
 
     RETRIES = 4
+    # HF caps commits per repo (128/hour, shared by all runs): on a 429, wait for the window
+    RATE_LIMIT_DELAY = 180.0
 
     def __init__(self, output_dir: Path, repo: str, run_name: str, enabled: bool):
         self.output_dir = output_dir
@@ -194,6 +196,9 @@ class _HubPusher:
             if enabled else None
         )
         self._api = None
+        # Max seconds a push may spend retrying (None: RETRIES attempts). Set by the trainer
+        # before deadline pushes so that a rate-limited push never outlives the job.
+        self.budget_s: Optional[float] = None
 
     def api(self):
         if self._api is None:
@@ -201,19 +206,34 @@ class _HubPusher:
             self._api = HfApi(token=os.environ.get("HF_TOKEN"))
         return self._api
 
-    def _retry(self, what: str, fn: Callable[[], Any]) -> None:
+    def _retry(self, what: str, fn: Callable[[], Any], budget_s: Optional[float] = None) -> None:
+        """Retry with backoff. With a time budget (arg, else self.budget_s), retry until the
+        budget is spent instead of RETRIES times. A 429 (commit rate limit) waits at least
+        RATE_LIMIT_DELAY."""
+        budget = budget_s if budget_s is not None else self.budget_s
+        t0 = time.time()
         delay = 15.0
-        for attempt in range(1, self.RETRIES + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 fn()
                 return
             except Exception as exc:
-                if attempt == self.RETRIES:
+                msg = str(exc)
+                if "429" in msg or "rate limit" in msg.lower():
+                    delay = max(delay, self.RATE_LIMIT_DELAY)
+                if budget is None:
+                    give_up = attempt >= self.RETRIES
+                else:
+                    give_up = time.time() - t0 + delay > budget
+                if give_up:
                     raise
-                logger.warning(f"[hf-push] {what} failed (attempt {attempt}/{self.RETRIES}): "
-                               f"{type(exc).__name__}: {exc}; retrying in {delay:.0f}s")
+                logger.warning(f"[hf-push] {what} failed (attempt {attempt}): "
+                               f"{type(exc).__name__}: {msg.splitlines()[0][:200] if msg else ''}; "
+                               f"retrying in {delay:.0f}s")
                 time.sleep(delay)
-                delay *= 2
+                delay = min(delay * 2, 900.0)
 
     def _upload_snapshot(self, snap: Path, name: str) -> bool:
         path_in_repo = f"{self.run_name}/{name}"
@@ -280,6 +300,52 @@ class _HubPusher:
         except Exception:
             logger.exception(f"[hf-push] FAILED to upload {path_in_repo}")
             return False
+
+    def commit_final(self, dirs: List[str], files: List[Path], budget_s: float) -> bool:
+        """ONE atomic commit with every final artefact (dirs + root files; TRAINING_DONE must be
+        among `files`), retried within `budget_s`, then TRAINING_DONE existence check.
+        One commit instead of ~12 per run: HF allows 128 commits/hour per repo."""
+        if not self.enabled:
+            return False
+        from huggingface_hub import CommitOperationAdd
+
+        self.wait()
+        snap_root = self.output_dir / ".push" / f"final-{time.time_ns()}"
+        try:
+            ops = []
+            for name in dirs:
+                src = self.output_dir / name
+                if not src.is_dir():
+                    continue
+                snap = snap_root / name
+                shutil.copytree(src, snap, copy_function=_link_or_copy)
+                for f in sorted(snap.rglob("*")):
+                    if f.is_file():
+                        ops.append(CommitOperationAdd(
+                            path_in_repo=f"{self.run_name}/{name}/{f.relative_to(snap).as_posix()}",
+                            path_or_fileobj=str(f)))
+            for f in files:
+                if f.is_file():
+                    ops.append(CommitOperationAdd(path_in_repo=f"{self.run_name}/{f.name}",
+                                                  path_or_fileobj=str(f)))
+            done_path = f"{self.run_name}/{TRAINING_DONE}"
+            if not any(op.path_in_repo == done_path for op in ops):
+                raise RuntimeError(f"{TRAINING_DONE} missing locally: not committing")
+
+            def _do():
+                self.api().create_commit(repo_id=self.repo, repo_type="dataset", operations=ops,
+                                         commit_message=f"Final {self.run_name}")
+                if not self.api().file_exists(self.repo, done_path, repo_type="dataset"):
+                    raise RuntimeError(f"{done_path} not visible on the Hub after the commit")
+
+            self._retry(f"final commit {self.run_name} ({len(ops)} files)", _do, budget_s=budget_s)
+            logger.info(f"[hf-push] final commit {self.run_name}: {len(ops)} files incl. {TRAINING_DONE}")
+            return True
+        except Exception:
+            logger.exception(f"[hf-push] FAILED final commit {self.run_name}")
+            return False
+        finally:
+            shutil.rmtree(snap_root, ignore_errors=True)
 
     def wait(self) -> None:
         for fut in list(self._pending.values()):
@@ -1340,33 +1406,35 @@ class GatedLoRATrainer:
             self._last_best_push_step = step
 
     def _push_on_deadline(self) -> None:
-        """Blocking: latest/ (resume state) + best_model/ if changed since last push."""
-        self._maybe_push_best(force=True, blocking=True)
-        self.pusher.submit_dir("latest", blocking=True)
-        self.pusher.wait()
+        """Blocking: latest/ (resume state) + best_model/ if changed since last push. Retries are
+        bounded by the time SLURM leaves after GLR_DEADLINE (sbatch: deadline = end - 600 s)."""
+        self.pusher.budget_s = 240.0
+        try:
+            self._maybe_push_best(force=True, blocking=True)
+            self.pusher.submit_dir("latest", blocking=True)
+            self.pusher.wait()
+        finally:
+            self.pusher.budget_s = None
 
     def finalize_push(self) -> None:
-        """End of run (blocking): best_model, final_model, latest, root files, then
-        TRAINING_DONE last with an existence check. Called by the pipeline after
-        final_results.json is written."""
+        """End of run (blocking): ONE commit with best_model, final_model, latest,
+        visualizations, the root result files and TRAINING_DONE, retried (rate limits) until
+        shortly before the deadline. Called by the pipeline after final_results.json is
+        written. On failure the outputs stay on the node (train.sbatch keeps them when
+        TRAINING_DONE is not on the Hub)."""
         try:
             if self.pusher.enabled:
-                self.pusher.wait()
-                self._maybe_push_best(force=True, blocking=True)
-                ok = self.pusher.submit_dir("final_model", blocking=True)
-                self.pusher.submit_dir("latest", blocking=True)
-                if (self.output_dir / "visualizations").is_dir():
-                    self.pusher.submit_dir("visualizations", blocking=True)
-                for fname in ("final_results.json", "eval_results.json", "routing_history.json",
-                              "final_examples.npz", "generation_results.json",
-                              "experiment_config.json", "data_stats.json"):
-                    self.pusher.upload_file(self.output_dir / fname)
-                if ok:
-                    if not self.pusher.upload_file(self.output_dir / TRAINING_DONE, verify=True):
-                        logger.error("TRAINING_DONE could not be pushed/verified on the Hub: "
-                                     "the chain may resubmit this run")
-                else:
-                    logger.error("final_model push failed: NOT pushing TRAINING_DONE")
+                budget = (self.deadline - time.time() - 60.0) if self.deadline else 3600.0
+                files = [self.output_dir / f for f in (
+                    "final_results.json", "eval_results.json", "routing_history.json",
+                    "final_examples.npz", "generation_results.json", "experiment_config.json",
+                    "data_stats.json", "frozen_gate_calibration.json", TRAINING_DONE)]
+                ok = self.pusher.commit_final(
+                    ["best_model", "final_model", "latest", "visualizations"], files,
+                    budget_s=max(budget, 120.0))
+                if not ok:
+                    logger.error("TRAINING_DONE could not be pushed/verified on the Hub: "
+                                 "the chain may resubmit this run (outputs kept on the node)")
         finally:
             self.pusher.shutdown()
 

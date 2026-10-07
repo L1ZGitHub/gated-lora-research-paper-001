@@ -56,7 +56,7 @@
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=48GB
+#SBATCH --mem=42000M  # 3 jobs per rtx6000 node (128520 MB); "42G" = 43008 MB would not fit
 # --partition / --exclude / --job-name / --dependency are set by chain_jobs.sh.
 
 # =========================== library ===================================
@@ -322,18 +322,18 @@ glr_upload_logs() {
     GLR_UP_RUN="$run" GLR_UP_REPO="${GLR_HF_REPO:-Helain/gated-lora-experiments}" \
         timeout 180 "$py" - "$@" <<'PYEOF' || true
 import os, sys
-from huggingface_hub import HfApi
+from huggingface_hub import CommitOperationAdd, HfApi
 api = HfApi()  # token from HF_TOKEN env; never login() (it writes the token to disk)
 run, repo = os.environ["GLR_UP_RUN"], os.environ["GLR_UP_REPO"]
-for p in sys.argv[1:]:
-    if not os.path.isfile(p):
-        continue
+# ONE commit for all log files (HF: 128 commits/hour per repo, shared by every run)
+ops = [CommitOperationAdd(path_in_repo=f"{run}/slurm_logs/{os.path.basename(p)}", path_or_fileobj=p)
+       for p in sys.argv[1:] if os.path.isfile(p)]
+if ops:
     try:
-        api.upload_file(path_or_fileobj=p, path_in_repo=f"{run}/slurm_logs/{os.path.basename(p)}",
-                        repo_id=repo, repo_type="dataset",
-                        commit_message=f"slurm log {os.path.basename(p)}")
+        api.create_commit(repo_id=repo, repo_type="dataset", operations=ops,
+                          commit_message=f"slurm logs {run}")
     except Exception as e:
-        print(f"[logs] upload failed for {p}: {e}", flush=True)
+        print(f"[logs] upload failed: {str(e).splitlines()[0][:200]}", flush=True)
 PYEOF
 }
 
@@ -380,7 +380,16 @@ glr_on_exit() {
     local rc=$?
     set +e
     trap - TERM INT
-    if [[ -d "$OUTPUT_DIR/latest" && ! -f "$OUTPUT_DIR/TRAINING_DONE" ]]; then
+    # Done only when TRAINING_DONE is ON THE HUB: a local TRAINING_DONE whose final commit
+    # failed (e.g. HF 429) must keep the outputs on the node for recovery/resume.
+    local done_hub=0
+    if [[ -f "$OUTPUT_DIR/TRAINING_DONE" ]] && glr_hf_done_probe "$GLR_RUN_NAME"; then
+        done_hub=1
+    elif [[ -f "$OUTPUT_DIR/TRAINING_DONE" ]]; then
+        glr_log "[exit] TRAINING_DONE is local only (push failed): keeping $OUTPUT_DIR" >&2
+        rm -f "$OUTPUT_DIR/TRAINING_DONE"  # next slice resumes latest/ and redoes the final push
+    fi
+    if [[ -d "$OUTPUT_DIR/latest" ]] && (( ! done_hub )); then
         # Keep outputs/ (latest/, best_model/) as a local resume candidate;
         # drop everything else (clone, venv, wandb, partial downloads).
         find "$WORK" -mindepth 1 -maxdepth 1 ! -name outputs ! -name gpu_claim -exec rm -rf {} + 2>/dev/null
@@ -392,7 +401,7 @@ glr_on_exit() {
     local py="${PYBIN:-python3}"
     [[ -x "$py" ]] || py=python3
     glr_upload_logs "$py" "$GLR_RUN_NAME" "${LOG_FILES[@]}"
-    if [[ ! -d "$OUTPUT_DIR/latest" || -f "$OUTPUT_DIR/TRAINING_DONE" ]]; then
+    if [[ ! -d "$OUTPUT_DIR/latest" ]] || (( done_hub )); then
         rm -rf "$WORK" 2>/dev/null
     fi
     glr_log "[exit] code=$rc at $(date -Iseconds)"

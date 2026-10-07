@@ -18,9 +18,9 @@ from huggingface_hub import HfApi, hf_hub_download
 
 REPO = "Helain/gated-lora-experiments"
 LR_SWEEPS = {  # arm -> {lr: config basename}
-    "gated": {1e-4: "v2_qwen25_05b_gated_lr1em4", 2e-4: "v2_qwen25_05b_gated",
+    "gated": {5e-5: "v2_qwen25_05b_gated_lr5em5", 1e-4: "v2_qwen25_05b_gated_lr1em4", 2e-4: "v2_qwen25_05b_gated",
               4e-4: "v2_qwen25_05b_gated_lr4em4"},
-    "baseline_r66": {1e-4: "v2_qwen25_05b_baseline_r66_lr1em4", 2e-4: "v2_qwen25_05b_baseline_r66",
+    "baseline_r66": {5e-5: "v2_qwen25_05b_baseline_r66_lr5em5", 1e-4: "v2_qwen25_05b_baseline_r66_lr1em4", 2e-4: "v2_qwen25_05b_baseline_r66",
                      4e-4: "v2_qwen25_05b_baseline_r66_lr4em4"},
 }
 

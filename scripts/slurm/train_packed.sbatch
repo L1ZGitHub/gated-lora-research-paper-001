@@ -19,9 +19,9 @@
 # TRAINING_DONE on HF.
 #
 # Usage (from the repo root on nash):
-#   sbatch --partition=rtx6000 --job-name=glr-pack \
-#       --export=ALL,GLR_PACK="configs/a.yaml:42 configs/b.yaml:42 configs/c.yaml:42" \
-#       scripts/slurm/train_packed.sbatch
+#   GLR_PACK="configs/a.yaml:42 configs/b.yaml:42 configs/c.yaml:42" \
+#       sbatch --partition=rtx6000 --job-name=glr-pack scripts/slurm/train_packed.sbatch
+#   (pass variables through the environment: --export=ALL,VAR=... jobs are held on ensicompute)
 #   GLR_PACK entries: <config>:<seed>[:<run_name>]; run_name defaults to
 #   <config basename>_seed<seed> (same as chain_jobs.sh).
 #

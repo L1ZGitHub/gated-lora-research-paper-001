@@ -1,4 +1,4 @@
-# LR sweep point (gated). Pick the LR on val, seed 0 only, then reuse for all seeds.
+# LR sweep point (gated). Pick the LR on val (Phase A: 2 seeds per point).
 extends:
   - models/qwen25_05b.yaml
   - tasks/all_8.yaml

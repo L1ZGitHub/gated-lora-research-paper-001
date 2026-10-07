@@ -1,0 +1,5 @@
+# v2 queue (launch_queue.sh --queue <this file>). Lines: <config> <seed> [<seed> ...]
+# Phase A extension (2026-10-07): LR 1e-4 won for both arms in Phase A and was the lowest
+# point of the sweep, so the optimum may be lower: add 5e-5 for gated and r66, 2 seeds.
+configs/experiments/v2/v2_qwen25_05b_gated_lr5em5.yaml 0 1
+configs/experiments/v2/v2_qwen25_05b_baseline_r66_lr5em5.yaml 0 1
