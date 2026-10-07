@@ -1,0 +1,17 @@
+# Plain LoRA r=16 (rank curve: gated must beat the plain-LoRA parameter/quality frontier).
+extends:
+  - models/qwen25_05b.yaml
+  - tasks/all_8.yaml
+  - base/v2.yaml
+
+experiment_name: v2_qwen25_05b_baseline_r16
+
+model:
+  model_type: baseline
+  lora_r: 16
+  lora_alpha: 32
+
+output:
+  output_dir: ./outputs/v2_qwen25_05b_baseline_r16
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: v2/qwen25_05b_baseline_r16

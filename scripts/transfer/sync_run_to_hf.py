@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Sync a completed training run to Hugging Face Hub, then optionally clean up.
+"""DEPRECATED (v2, 2026-10-07): not used by any pipeline. Needs SSH from the VPS
+to Ensimag (blocked by the school firewall) and mirrors legacy checkpoint-N/
+layouts. Kept only for a possible local one-off upload; slated for removal.
+
+Sync a completed training run to Hugging Face Hub, then optionally clean up.
 
 Designed to run on the **VPS** (which can reach both Ensimag via SSH and
 HF Hub over HTTPS). Usage from the VPS:

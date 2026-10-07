@@ -18,6 +18,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def masked_token_mean(values: torch.Tensor, token_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    """
+    Mean over the (batch, seq) dims, restricted to real tokens.
+
+    Args:
+        values: [batch, seq_len] or [batch, seq_len, k]
+        token_mask: [batch, seq_len] (1 = real token, 0 = padding) or None (all tokens)
+
+    Returns:
+        Scalar (for [batch, seq_len]) or [k]. No host sync (denominator stays on device).
+    """
+    if token_mask is None:
+        return values.mean(dim=(0, 1))
+    m = token_mask.to(device=values.device, dtype=values.dtype)
+    if values.dim() == 3:
+        m = m.unsqueeze(-1)
+    denom = m.sum(dim=(0, 1)).clamp_min(1.0)
+    return (values * m).sum(dim=(0, 1)) / denom
+
+
 class GatingMLP(nn.Module):
     """
     Simple MLP for computing gating logits.
@@ -85,12 +105,12 @@ class GatingMLP(nn.Module):
         Returns:
             Logits [batch, seq_len, num_experts]
         """
-        # Add layer embedding if available and layer_idx provided
+        # Add layer embedding if available and layer_idx provided.
+        # Index the weight with the python int directly: no host->device copy
+        # (the old `torch.tensor(layer_idx, device=...)` synced once per layer).
         if self.layer_embedding is not None and layer_idx is not None:
-            layer_emb = self.layer_embedding(
-                torch.tensor(layer_idx, device=x.device)
-            )  # [input_dim]
-            x = x + layer_emb.unsqueeze(0).unsqueeze(0)  # Broadcast to [batch, seq, input_dim]
+            layer_emb = self.layer_embedding.weight[layer_idx]  # [input_dim]
+            x = x + layer_emb  # Broadcast to [batch, seq, input_dim]
 
         return self.gate(x)
 
@@ -100,8 +120,12 @@ class LayerGatingNetwork(nn.Module):
     Per-layer gating network.
 
     Each transformer layer has its own gating MLP, allowing different
-    layers to learn different expert preferences. Each MLP also receives
-    a layer embedding to enable layer-aware routing.
+    layers to learn different expert preferences.
+
+    A layer embedding is NOT used here: each gate only ever sees its own layer
+    index, so x + e_l followed by Linear(W, b) is just a bias shift (b + W e_l) —
+    no extra expressivity, only extra parameters. ``use_layer_embedding`` is
+    accepted for signature compatibility and ignored (see GatingNetwork).
     """
 
     def __init__(
@@ -117,11 +141,10 @@ class LayerGatingNetwork(nn.Module):
 
         self.num_layers = num_layers
         self.num_experts = num_experts
-        self.use_layer_embedding = use_layer_embedding
+        # Layer embedding is never allocated with per-layer gates (pure bias shift).
+        self.use_layer_embedding = False
 
-        # Create one gating MLP per layer
-        # Each MLP has its own weights BUT also receives layer index embedding
-        # This provides both per-layer specialization AND explicit layer awareness
+        # Create one gating MLP per layer (no layer embedding, see class docstring)
         self.layer_gates = nn.ModuleList([
             GatingMLP(
                 input_dim=input_dim,
@@ -129,12 +152,12 @@ class LayerGatingNetwork(nn.Module):
                 num_experts=num_experts,
                 dropout=dropout,
                 num_layers=num_layers,
-                use_layer_embedding=use_layer_embedding,
+                use_layer_embedding=False,
             )
             for _ in range(num_layers)
         ])
 
-        logger.info(f"Created per-layer gating with {num_layers} layers, {num_experts} experts, layer_embedding={use_layer_embedding}")
+        logger.info(f"Created per-layer gating with {num_layers} layers, {num_experts} experts (no layer embedding)")
 
     def forward(
         self,
@@ -258,10 +281,27 @@ class GatingNetwork(nn.Module):
         self.use_top_k = use_top_k
         self.top_k = min(top_k, num_experts)
         self.temperature = temperature
+
+        uses_per_layer_gates = per_layer_gating and num_layers > 1
+        if uses_per_layer_gates and use_layer_embedding:
+            logger.warning(
+                "use_layer_embedding=True is ignored with per_layer_gating=True: each per-layer "
+                "gate only sees its own layer index, so the embedding is a constant bias shift "
+                "of the first gate Linear. No layer embedding is allocated."
+            )
+            use_layer_embedding = False
+        # Effective value (False with per-layer gates)
         self.use_layer_embedding = use_layer_embedding
 
+        if use_top_k and self.top_k == 1:
+            logger.warning(
+                "top_k=1: the softmax over a single selected expert is constant 1.0, so the gate "
+                "receives NO gradient from the LM loss (only routing *selection* changes, which "
+                "is not differentiable). Use top_k >= 2 or dense routing to train the gate."
+            )
+
         # Create appropriate gating network
-        if per_layer_gating and num_layers > 1:
+        if uses_per_layer_gates:
             self.gating = LayerGatingNetwork(
                 num_layers=num_layers,
                 input_dim=hidden_dim,
@@ -286,18 +326,28 @@ class GatingNetwork(nn.Module):
         self,
         hidden_states: torch.Tensor,
         layer_idx: int = 0,
+        token_mask: Optional[torch.Tensor] = None,
+        compute_stats: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Compute gating weights with routing statistics.
+        Compute gating weights (once per layer) and, optionally, routing statistics.
+
+        Temperature is applied before both the dense softmax and the top-k softmax; the
+        returned (tempered, possibly sparse) gate weights are what the experts are mixed
+        with, for every target module of the layer.
 
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_dim]
-            layer_idx: Which layer (for per-layer gating)
+            layer_idx: Which layer (for per-layer gating / layer embedding)
+            token_mask: [batch, seq_len] real-token mask for the statistics (None = all)
+            compute_stats: If False, skip the statistics (training fast path); the returned
+                routing_info then only holds gate_weights / gate_logits references.
 
         Returns:
             Tuple of:
-                - gate_weights: [batch, seq_len, num_experts] (probabilities)
-                - gate_logits: [batch, seq_len, num_experts] (raw logits)
+                - gate_weights: [batch, seq_len, num_experts] (probabilities; zeros for
+                  unselected experts with top-k)
+                - gate_logits: [batch, seq_len, num_experts] (raw logits, no temperature)
                 - routing_info: Dict with statistics
         """
         # Get raw logits
@@ -308,27 +358,35 @@ class GatingNetwork(nn.Module):
 
         if self.use_top_k:
             # Sparse top-k routing
-            gate_weights, routing_info = self._compute_top_k_weights(scaled_logits)
+            gate_weights, top_k_indices = self._compute_top_k_weights(scaled_logits)
         else:
             # Dense softmax routing
             gate_weights = F.softmax(scaled_logits, dim=-1)
-            routing_info = self._compute_routing_stats(gate_weights, gate_logits)
+            top_k_indices = None
+
+        if compute_stats:
+            routing_info = self._compute_routing_stats(gate_weights, gate_logits, token_mask)
+            if top_k_indices is not None:
+                routing_info["top_k_indices"] = top_k_indices
+                routing_info["sparsity"] = 1.0 - (self.top_k / self.num_experts)
+        else:
+            routing_info = {"gate_weights": gate_weights, "gate_logits": gate_logits}
 
         return gate_weights, gate_logits, routing_info
 
     def _compute_top_k_weights(
         self,
         logits: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute sparse top-k gating weights.
 
         Args:
-            logits: [batch, seq_len, num_experts]
+            logits: [batch, seq_len, num_experts] (already divided by the temperature)
 
         Returns:
             gate_weights: [batch, seq_len, num_experts] (sparse)
-            routing_info: Statistics dict
+            top_k_indices: [batch, seq_len, top_k]
         """
         # Get top-k
         top_k_logits, top_k_indices = torch.topk(logits, self.top_k, dim=-1)
@@ -336,39 +394,41 @@ class GatingNetwork(nn.Module):
         # Softmax only on top-k
         top_k_weights = F.softmax(top_k_logits, dim=-1)
 
-        # Scatter back to full size
-        gate_weights = torch.zeros_like(logits)
-        gate_weights.scatter_(-1, top_k_indices, top_k_weights)
+        # Scatter back to full size. Allocate in the softmax dtype: under autocast the
+        # logits may be fp16 while softmax returns fp32 (scatter needs matching dtypes).
+        gate_weights = torch.zeros(logits.shape, device=logits.device, dtype=top_k_weights.dtype)
+        gate_weights = gate_weights.scatter(-1, top_k_indices, top_k_weights)
 
-        # Compute stats
-        routing_info = self._compute_routing_stats(gate_weights, logits)
-        routing_info["top_k_indices"] = top_k_indices
-        routing_info["sparsity"] = 1.0 - (self.top_k / self.num_experts)
-
-        return gate_weights, routing_info
+        return gate_weights, top_k_indices
 
     def _compute_routing_stats(
         self,
         gate_weights: torch.Tensor,
         gate_logits: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute routing statistics for logging and analysis.
+        Compute routing statistics for logging and analysis (real tokens only).
+
+        All values stay on device (no host sync); convert with .item() at logging time.
 
         Args:
             gate_weights: [batch, seq_len, num_experts]
             gate_logits: [batch, seq_len, num_experts]
+            token_mask: [batch, seq_len] (1 = real token) or None (all tokens)
 
         Returns:
             Dict with various routing metrics
         """
-        # Expert usage (mean probability per expert)
-        expert_usage = gate_weights.mean(dim=[0, 1])  # [num_experts]
+        gate_weights_stats = gate_weights.detach()
+
+        # Expert usage (mean probability per expert over real tokens)
+        expert_usage = masked_token_mean(gate_weights_stats, token_mask)  # [num_experts]
 
         # Entropy of routing distribution (higher = more uncertain)
         eps = 1e-8
-        entropy = -torch.sum(gate_weights * torch.log(gate_weights + eps), dim=-1)
-        mean_entropy = entropy.mean()
+        entropy = -torch.sum(gate_weights_stats * torch.log(gate_weights_stats + eps), dim=-1)
+        mean_entropy = masked_token_mean(entropy, token_mask)
 
         # Max entropy for normalization
         max_entropy = math.log(self.num_experts)
@@ -378,14 +438,8 @@ class GatingNetwork(nn.Module):
         load_imbalance = expert_usage.std()
 
         # Top-1 dominance (how often does one expert dominate)
-        top1_probs = gate_weights.max(dim=-1).values
-        top1_dominance = top1_probs.mean()
-
-        # Per-expert usage
-        expert_usage_dict = {
-            f"expert_{i}_usage": expert_usage[i].item()
-            for i in range(self.num_experts)
-        }
+        top1_probs = gate_weights_stats.max(dim=-1).values
+        top1_dominance = masked_token_mean(top1_probs, token_mask)
 
         return {
             "gate_weights": gate_weights,
@@ -395,13 +449,13 @@ class GatingNetwork(nn.Module):
             "normalized_entropy": normalized_entropy,
             "load_imbalance": load_imbalance,
             "top1_dominance": top1_dominance,
-            **expert_usage_dict,
         }
 
     def compute_load_balancing_loss(
         self,
         gate_weights: torch.Tensor,
         gate_logits: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute load balancing loss to encourage expert diversity.
@@ -413,27 +467,49 @@ class GatingNetwork(nn.Module):
         - f_i = fraction of tokens routed to expert i
         - P_i = fraction of router probability allocated to expert i
 
+        Both f and P are averaged over real tokens only (padding excluded).
+
         Args:
             gate_weights: [batch, seq_len, num_experts]
             gate_logits: [batch, seq_len, num_experts]
+            token_mask: [batch, seq_len] (1 = real token) or None (all tokens)
 
         Returns:
             Scalar loss value
         """
-        # Flatten batch and sequence
-        num_tokens = gate_weights.shape[0] * gate_weights.shape[1]
-
-        # f_i: fraction of tokens where expert i has highest weight
+        # f_i: fraction of real tokens where expert i has highest weight (no gradient)
         expert_mask = F.one_hot(gate_weights.argmax(dim=-1), self.num_experts)
-        f = expert_mask.to(gate_weights.dtype).sum(dim=[0, 1]) / num_tokens  # [num_experts]
+        f = masked_token_mean(expert_mask.to(gate_weights.dtype), token_mask)  # [num_experts]
 
-        # P_i: mean probability for each expert
-        P = gate_weights.mean(dim=[0, 1])  # [num_experts]
+        # P_i: mean probability for each expert over real tokens
+        P = masked_token_mean(gate_weights, token_mask)  # [num_experts]
 
         # Auxiliary loss
         aux_loss = self.num_experts * torch.sum(f * P)
 
         return aux_loss
+
+    def compute_gate_entropy(
+        self,
+        gate_weights: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Mean gate entropy over real tokens (the historical "L1" gate regulariser).
+
+        `gate_weights.abs().mean()` was a no-op post-softmax (constant 1/num_experts); the
+        entropy is the differentiable sparsity surrogate (minimising it sharpens routing).
+
+        Args:
+            gate_weights: [batch, seq_len, num_experts]
+            token_mask: [batch, seq_len] (1 = real token) or None (all tokens)
+
+        Returns:
+            Scalar entropy (nats)
+        """
+        eps = 1e-10
+        entropy = -(gate_weights * (gate_weights + eps).log()).sum(dim=-1)  # [batch, seq]
+        return masked_token_mean(entropy, token_mask)
 
     def compute_entropy_regularization(
         self,

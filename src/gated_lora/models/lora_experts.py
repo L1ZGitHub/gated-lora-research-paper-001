@@ -11,8 +11,13 @@ import torch.nn.functional as F
 from typing import List, Optional, Dict, Tuple
 import math
 import logging
+import os
 
 logger = logging.getLogger(__name__)
+
+# Fused expert computation (default). GLR_UNFUSED_EXPERTS=1 restores the original per-expert
+# loop; kept only to benchmark / check equivalence against the historical implementation.
+FUSED_EXPERTS = os.environ.get("GLR_UNFUSED_EXPERTS", "0") != "1"
 
 
 class LoRALayer(nn.Module):
@@ -276,18 +281,35 @@ class LoRAExpertPool(nn.Module):
         hidden_states: torch.Tensor,
         module_name: str,
         gate_weights: torch.Tensor,
+        output_scale: float = 1.0,
+        expanded_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Get weighted combination of expert outputs.
 
         Args:
-            hidden_states: Input tensor [batch, seq_len, hidden]
+            hidden_states: Input tensor [batch, seq_len, hidden] (already in the adapter
+                dtype, or any dtype under autocast)
             module_name: Which module to compute LoRA for
-            gate_weights: Gating weights [batch, seq_len, num_experts]
+            gate_weights: Gating weights [batch, seq_len, num_experts] (dense softmax or
+                sparse top-k weights, zeros for unselected experts)
+            output_scale: Multiplier on the mixed output (``gate_output_scale``). Gate
+                weights sum to 1, so with output_scale=1 each expert is effectively scaled
+                by ~1/num_experts compared with a plain LoRA; output_scale=num_experts makes
+                uniform routing equal to a plain LoRA with the summed ranks.
+            expanded_gate: Optional precomputed ``expand_gate_weights(gate_weights,
+                output_scale)`` [batch, seq_len, sum(ranks)] (fused path only). The model
+                computes it once per layer and reuses it for every target module.
 
         Returns:
             Weighted sum [batch, seq_len, out_dim]
         """
+        if FUSED_EXPERTS:
+            if expanded_gate is None:
+                expanded_gate = self.expand_gate_weights(gate_weights, output_scale)
+            return self.fused_output_from_expanded(hidden_states, module_name, expanded_gate)
+
+        # Legacy per-expert loop (GLR_UNFUSED_EXPERTS=1)
         # Get all expert outputs: [batch, seq, num_experts, out_dim]
         expert_outputs = self.get_expert_outputs(hidden_states, module_name)
 
@@ -297,6 +319,8 @@ class LoRAExpertPool(nn.Module):
         # Weighted sum: [batch, seq, out_dim]
         weighted_output = (expert_outputs * gate_weights).sum(dim=2)
 
+        if output_scale != 1.0:
+            weighted_output = weighted_output * output_scale
         return weighted_output
 
     def get_top_k_weighted_output(
@@ -305,17 +329,23 @@ class LoRAExpertPool(nn.Module):
         module_name: str,
         gate_logits: torch.Tensor,
         top_k: int = 2,
+        output_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Get sparse top-k weighted combination of expert outputs.
+        Get sparse top-k weighted combination of expert outputs from raw logits.
 
-        Only computes outputs for selected experts (more efficient).
+        NOTE: kept for API compatibility / standalone use only. GatedLoRAModelV2 no longer
+        calls it: the tempered top-k weights are computed once per layer by
+        ``GatingNetwork`` and passed to ``get_weighted_output`` (zeros for unselected
+        experts give the same result).
 
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden]
             module_name: Which module to compute LoRA for
-            gate_logits: Raw gating logits [batch, seq_len, num_experts]
+            gate_logits: Raw gating logits [batch, seq_len, num_experts] (no temperature
+                applied here)
             top_k: Number of experts to use
+            output_scale: Multiplier on the mixed output (see ``get_weighted_output``)
 
         Returns:
             Tuple of:
@@ -331,12 +361,21 @@ class LoRAExpertPool(nn.Module):
         # Softmax only on top-k
         top_k_weights = F.softmax(top_k_logits, dim=-1)
 
+        # Reconstruct full gate weights: unselected experts get weight 0
+        # (softmax dtype: under autocast the logits may be fp16 while softmax returns fp32)
+        full_gate_weights = torch.zeros(gate_logits.shape, device=gate_logits.device, dtype=top_k_weights.dtype)
+        full_gate_weights.scatter_(-1, top_k_indices, top_k_weights)
+
+        if FUSED_EXPERTS:
+            # Same math as the loop below. No `expert_mask.any()` host sync.
+            return self._fused_output(hidden_states, module_name, full_gate_weights, output_scale), full_gate_weights
+
         # Compute outputs only for selected experts
         # This is more complex but more efficient for sparse routing
 
         # Initialize output
         out_dim = self.experts[0].lora_layers[module_name].out_features
-        output = torch.zeros(batch_size, seq_len, out_dim, device=hidden_states.device, dtype=hidden_states.dtype)
+        output = None
 
         # For each expert, compute contribution where it was selected
         for expert_idx, expert in enumerate(self.experts):
@@ -352,13 +391,98 @@ class LoRAExpertPool(nn.Module):
                 expert_output = expert.get_lora_delta(hidden_states, module_name)
 
                 # Add weighted contribution
-                output = output + expert_weight * expert_output
+                contribution = expert_weight * expert_output
+                output = contribution if output is None else output + contribution
 
-        # Reconstruct full gate weights for logging
-        full_gate_weights = torch.zeros_like(gate_logits)
-        full_gate_weights.scatter_(-1, top_k_indices, top_k_weights)
+        if output is None:
+            output = torch.zeros(batch_size, seq_len, out_dim, device=hidden_states.device,
+                                 dtype=self.param_dtype)
+        if output_scale != 1.0:
+            output = output * output_scale
 
         return output, full_gate_weights
+
+    @property
+    def param_dtype(self) -> torch.dtype:
+        """dtype of the expert parameters (fp32 in v2)."""
+        return self.experts[0].lora_layers[self.target_modules[0]].lora_A.weight.dtype
+
+    def expand_gate_weights(
+        self,
+        gate_weights: torch.Tensor,
+        output_scale: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Expand per-expert gate weights to per-rank-column multipliers.
+
+        Returns ``g[..., expert_of_rank] * (alpha_e / r_e) * output_scale`` with shape
+        [batch, seq_len, sum(ranks)]. Every expert has the same rank for all target modules,
+        so the result depends only on the layer and is shared by all its target modules.
+        Computed in the gate dtype (fp32 softmax output), never in the activation dtype.
+        """
+        expert_of_rank, scale = self._rank_layout(gate_weights.device, gate_weights.dtype, output_scale)
+        return gate_weights.index_select(-1, expert_of_rank) * scale
+
+    def fused_output_from_expanded(
+        self,
+        hidden_states: torch.Tensor,
+        module_name: str,
+        expanded_gate: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        sum_e g_e * s_e * B_e A_e x, computed as two matmuls over the concatenated ranks:
+
+            h = x @ [A_1; ...; A_E]^T              [batch, seq, R]   (R = sum of ranks)
+            h = h * expanded_gate                  (g repeated over each expert's rank block * s)
+            out = h @ [B_1 | ... | B_E]^T           [batch, seq, out_dim]
+
+        Exactly equal to the per-expert weighted sum (linearity). Parameters are not
+        changed, so checkpoints stay compatible. One difference in training only: the
+        input dropout mask is shared by the experts instead of drawn per expert.
+
+        dtype: without autocast, ``hidden_states`` must already be in the parameter dtype
+        (the model hook casts it); h * expanded_gate stays in that dtype. Under autocast
+        F.linear runs in the autocast dtype, the product with the fp32 expanded gate is
+        promoted to fp32 and the second F.linear autocasts again.
+        """
+        layers = [expert.lora_layers[module_name] for expert in self.experts]
+        A = torch.cat([layer.lora_A.weight for layer in layers], dim=0)
+        B = torch.cat([layer.lora_B.weight for layer in layers], dim=1)
+        h = F.linear(layers[0].dropout(hidden_states), A)
+        h = h * expanded_gate
+        return F.linear(h, B)
+
+    def _fused_output(
+        self,
+        hidden_states: torch.Tensor,
+        module_name: str,
+        gate_weights: torch.Tensor,
+        output_scale: float = 1.0,
+    ) -> torch.Tensor:
+        """Fused weighted output from per-expert gate weights (see ``fused_output_from_expanded``)."""
+        expanded_gate = self.expand_gate_weights(gate_weights, output_scale)
+        return self.fused_output_from_expanded(hidden_states, module_name, expanded_gate)
+
+    def _rank_layout(self, device, dtype, output_scale: float = 1.0):
+        """
+        Index of the expert owning each rank column, and the per-column LoRA scaling
+        (alpha_e / r_e) * output_scale. Cached per (device, dtype, output_scale); built once
+        (one small host->device copy), so no transfer in the steady-state forward path.
+        """
+        key = (device, dtype, float(output_scale))
+        cache = self.__dict__.setdefault("_rank_layout_cache", {})
+        if key not in cache:
+            ranks = [expert.rank for expert in self.experts]
+            scalings = [expert.alpha / expert.rank for expert in self.experts]
+            expert_of_rank = torch.tensor(
+                [e for e, r in enumerate(ranks) for _ in range(r)], device=device, dtype=torch.long
+            )
+            scale = torch.tensor(
+                [s * float(output_scale) for s, r in zip(scalings, ranks) for _ in range(r)],
+                device=device, dtype=dtype,
+            )
+            cache[key] = (expert_of_rank, scale)
+        return cache[key]
 
     def num_parameters(self) -> int:
         """Total parameters across all experts."""

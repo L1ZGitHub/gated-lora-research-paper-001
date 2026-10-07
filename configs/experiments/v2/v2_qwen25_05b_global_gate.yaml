@@ -1,0 +1,17 @@
+# Ablation: one gate MLP shared by all layers + layer embedding (legacy per_layer_gating=false).
+# Tests whether per-layer gates are needed (24x fewer gate params).
+extends:
+  - models/qwen25_05b.yaml
+  - tasks/all_8.yaml
+  - base/v2.yaml
+
+experiment_name: v2_qwen25_05b_global_gate
+
+model:
+  per_layer_gating: false
+  use_layer_embedding: true
+
+output:
+  output_dir: ./outputs/v2_qwen25_05b_global_gate
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: v2/qwen25_05b_global_gate

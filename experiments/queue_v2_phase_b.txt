@@ -1,0 +1,18 @@
+# v2 queue (launch_queue.sh --queue <this file>). Lines: <config> <seed> [<seed> ...]
+# Run names = <config basename>_seed<N> (v2_ prefix: never collides with v1 runs on HF).
+# Launch only after Phase A: set the LR (base/v2.yaml or per arm) and
+# frozen_gate_target_top1 (v2_qwen25_05b_frozen_gate.yaml) from its results.
+# --- v2 Phase B: at the chosen LR (edit the base LR first if it is not 2e-4) ---
+# Headline arms, 5 seeds (seeds 0 1 already exist from Phase A if the LR is 2e-4):
+configs/experiments/v2/v2_qwen25_05b_gated.yaml 2 3 4
+configs/experiments/v2/v2_qwen25_05b_baseline_r66.yaml 2 3 4
+configs/experiments/v2/v2_qwen25_05b_baseline_r56.yaml 0 1 2 3 4
+# Controls / ablations, 3 seeds:
+configs/experiments/v2/v2_qwen25_05b_frozen_gate.yaml 0 1 2
+configs/experiments/v2/v2_qwen25_05b_equal_rank.yaml 0 1 2
+configs/experiments/v2/v2_qwen25_05b_gated_last_quarter.yaml 0 1 2
+# Rank curve + per-layer-gate question, 1 seed (3 if they bracket gated):
+configs/experiments/v2/v2_qwen25_05b_baseline_r8.yaml 0
+configs/experiments/v2/v2_qwen25_05b_baseline_r16.yaml 0
+configs/experiments/v2/v2_qwen25_05b_baseline_r32.yaml 0
+configs/experiments/v2/v2_qwen25_05b_global_gate.yaml 0

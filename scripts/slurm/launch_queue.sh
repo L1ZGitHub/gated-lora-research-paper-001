@@ -2,13 +2,14 @@
 # Multi-run orchestrator: runs every (config × seed) from experiments/queue.txt
 # through chain_jobs.sh, with a cap on CONCURRENT runs.
 #
-# Each run occupies exactly 1 GPU at a time (train.sbatch asks --gres=gpu:1),
-# so --max-concurrent IS the GPU footprint of the whole campaign. Default 4
-# → at most 4 of the 18 pinned rtx6000 GPUs (turing-[4-9] × 3) are ours.
+# Each run occupies 1 GPU while running (train.sbatch asks --gres=gpu:1);
+# chain_jobs.sh also keeps ONE pending pre-submitted slice per run, so
+# --max-concurrent bounds both running GPUs and queued slices.
 #
-# The 4h MaxTime is handled INSIDE each chain: the trainer exits at 3h30 with
-# a pushed "latest" checkpoint, chain_jobs.sh resubmits until TRAINING_DONE
-# appears on HF Hub. Nothing is stored on the NFS home except tiny text logs.
+# The 4h MaxTime is handled INSIDE each chain: the trainer stops before
+# GLR_DEADLINE (set by train.sbatch) with a pushed latest/, chain_jobs.sh
+# resubmits until TRAINING_DONE appears on HF Hub. Nothing is stored on the
+# NFS home except tiny text logs and logs/chains/<run>.lock.
 #
 # Usage (from the repo root on the Ensimag frontale):
 #   # See what would run, without launching anything:
@@ -25,7 +26,7 @@
 #   --queue <file>          default experiments/queue.txt
 #   --max-concurrent <N>    default 4 (concurrent runs = GPUs used)
 #   --partition <name>      default rtx6000
-#   --nodelist <spec>       default: chain_jobs.sh's per-partition default
+#   --exclude <nodes>       nodes to avoid (comma list), default none
 #   --max-jobs <N>          per-run chain budget, default 10 (= 10×4h slices)
 #   --dry-run               print the plan and exit — LAUNCHES NOTHING
 
@@ -34,7 +35,7 @@ set -uo pipefail
 QUEUE_FILE="experiments/queue.txt"
 MAX_CONCURRENT=4
 PARTITION="rtx6000"
-NODELIST=""
+EXCLUDE="${GLR_EXCLUDE_NODES:-}"
 MAX_JOBS=10
 DRY_RUN=0
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -44,14 +45,15 @@ while [[ $# -gt 0 ]]; do
         --queue)          QUEUE_FILE="$2"; shift 2 ;;
         --max-concurrent) MAX_CONCURRENT="$2"; shift 2 ;;
         --partition)      PARTITION="$2"; shift 2 ;;
-        --nodelist)       NODELIST="$2"; shift 2 ;;
+        --exclude)        EXCLUDE="$2"; shift 2 ;;
+        --nodelist)       echo "ERROR: --nodelist was removed; use --exclude" >&2; exit 1 ;;
         --max-jobs)       MAX_JOBS="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=1; shift ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
 done
 
-cd "$PROJECT_ROOT"
+cd "$PROJECT_ROOT" || exit 1
 mkdir -p logs/chains
 
 if [[ ! -f "$QUEUE_FILE" ]]; then
@@ -86,7 +88,7 @@ echo "  Queue file:      $QUEUE_FILE"
 echo "  Runs:            ${#RUNS[@]}"
 echo "  Max concurrent:  $MAX_CONCURRENT (= max GPUs used at once)"
 echo "  Partition:       $PARTITION"
-echo "  Nodelist:        ${NODELIST:-<per-partition default>}"
+echo "  Exclude:         ${EXCLUDE:-<none>}"
 echo "  Chain budget:    $MAX_JOBS jobs/run"
 echo "==================================================================="
 for r in "${RUNS[@]}"; do
@@ -108,8 +110,8 @@ launch_one() {
     run_name="$(basename "$config" .yaml)_seed${seed}"
     local log="logs/chains/${run_name}.log"
     local args=(--config "$config" --seed "$seed" --max-jobs "$MAX_JOBS" --partition "$PARTITION")
-    if [[ -n "$NODELIST" ]]; then
-        args+=(--nodelist "$NODELIST")
+    if [[ -n "$EXCLUDE" ]]; then
+        args+=(--exclude "$EXCLUDE")
     fi
     echo "[queue] starting chain: $run_name (log: $log)"
     bash scripts/slurm/chain_jobs.sh "${args[@]}" >> "$log" 2>&1 &

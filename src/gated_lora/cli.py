@@ -33,6 +33,9 @@ from gated_lora.training.config import (
 
 logger = logging.getLogger(__name__)
 
+# sysexits.h EX_CONFIG: chain_jobs.sh stops the chain instead of resubmitting.
+EXIT_CONFIG_ERROR = 78
+
 
 def _filter_kwargs(cls: type, data: Dict[str, Any]) -> Dict[str, Any]:
     """Keep only fields that the dataclass actually defines."""
@@ -143,14 +146,25 @@ def main() -> int:
     )
     args = parse_args()
 
-    raw = load_config(args.config)
-    config = dict_to_experiment_config(raw)
+    try:
+        raw = load_config(args.config)
+        config = dict_to_experiment_config(raw)
+    except (OSError, TypeError, ValueError) as e:
+        logger.error(f"Invalid config {args.config}: {e}")
+        return EXIT_CONFIG_ERROR
 
     config.seed = args.seed
+    config.training.seed = args.seed  # --seed is the run seed (init, sampler, train subset)
     if args.output_dir:
         config.output_dir = args.output_dir
     if args.resume:
         config.resume_from_checkpoint = args.resume
+
+    try:
+        config.validate()  # fail fast (before SLURM spends GPU time) on v2 misconfiguration
+    except ValueError as e:
+        logger.error(f"Invalid config {args.config}: {e}")
+        return EXIT_CONFIG_ERROR
 
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
     config.save(Path(config.output_dir) / "experiment_config.json")
@@ -166,7 +180,11 @@ def main() -> int:
 
     from gated_lora.training.pipeline import run_experiment
 
-    run_experiment(config, analyze_routing=args.analyze_routing)
+    try:
+        run_experiment(config, analyze_routing=args.analyze_routing)
+    except FloatingPointError as e:  # numeric overflow: the precision setting must change
+        logger.error(str(e))
+        return EXIT_CONFIG_ERROR
     return 0
 
 

@@ -8,15 +8,31 @@
 # hasn't started" (idle, info-only) from "no runs because something broke"
 # (warn).
 
+# =====================================================================
+# v2 (data_format v2) — ACTIVE SECTION
+# Filled in by the integrator once the v2 configs exist. v2 results are NOT
+# comparable with the legacy (v1) runs below.
+# =====================================================================
+
+# Active v2 queues (launch with --queue):
+#   experiments/queue_v2_phase_a.txt  LR sweep, 12 runs
+#   experiments/queue_v2_phase_b.txt  main grid, after Phase A (see its header)
+
+# =====================================================================
+# LEGACY v1 HISTORY — kept for reference only, all entries commented out.
+# Do not re-enable: these configs predate the v2 contract (2026-10-07).
+# =====================================================================
+
 # === Smoke (re-validate pipeline after 2026-07 fixes, ~15 min) ===
 # configs/experiments/smoke_phi2.yaml 0
 
 # === Phase 1: THE paper comparison — gated vs param-matched baselines ===
 # Same tasks, same data caps, same training budget; only the adapter differs.
 # r72 = total-param-matched (harshest), r56 = expert-capacity-matched.
-configs/experiments/phi2_harder_multitask.yaml 42
-configs/experiments/phi2_baseline_r72.yaml 42
-configs/experiments/phi2_baseline_r56.yaml 42
+# (These 3 lines were the ACTIVE entries before the v2 switch.)
+# configs/experiments/phi2_harder_multitask.yaml 42
+# configs/experiments/phi2_baseline_r72.yaml 42
+# configs/experiments/phi2_baseline_r56.yaml 42
 
 # === Phase 2: Phi-2 multi-seed (paper figures need >= 3 seeds) ===
 # configs/experiments/phi2_harder_multitask.yaml 1337 2024

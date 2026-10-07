@@ -1,5 +1,7 @@
 # Ablation: disable layer-index embedding fed to the gating MLP.
 # Tests whether the gating relies on layer position to specialize.
+# v2: a NO-OP with per_layer_gating: true (the embedding is only a bias shift there and is not
+# allocated). Use experiments/v2/v2_qwen25_05b_global_gate.yaml (shared gate + embedding) instead.
 ablation:
   name: no_layer_embedding
   description: "Layer index embedding removed from gating input"

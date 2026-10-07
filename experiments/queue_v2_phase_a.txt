@@ -1,0 +1,12 @@
+# v2 queue (launch_queue.sh --queue <this file>). Lines: <config> <seed> [<seed> ...]
+# Run names = <config basename>_seed<N> (v2_ prefix: never collides with v1 runs on HF).
+# --- v2 Phase A: LR sweep, 2 seeds per point, gated + param-matched baseline (12 runs) ---
+# Pick the LR per arm on val macro answer loss (mean of 2 seeds). r56/r8/r16/r32 reuse r66's LR
+# (same alpha/r = 2). Then set frozen_gate_target_top1 from the gated runs (see its YAML).
+configs/experiments/v2/v2_qwen25_05b_gated_lr1em4.yaml 0 1
+configs/experiments/v2/v2_qwen25_05b_gated.yaml 0 1
+configs/experiments/v2/v2_qwen25_05b_gated_lr4em4.yaml 0 1
+configs/experiments/v2/v2_qwen25_05b_baseline_r66_lr1em4.yaml 0 1
+configs/experiments/v2/v2_qwen25_05b_baseline_r66.yaml 0 1
+configs/experiments/v2/v2_qwen25_05b_baseline_r66_lr4em4.yaml 0 1
+#

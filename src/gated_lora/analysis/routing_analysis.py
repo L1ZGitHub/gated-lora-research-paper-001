@@ -42,19 +42,18 @@ class RoutingAnalyzer:
     def __init__(self, num_experts: int, num_layers: int):
         self.num_experts = num_experts
         self.num_layers = num_layers
+        self.clear()
 
-        # Storage for routing data
-        self.expert_usage_per_layer: List[List[float]] = [[] for _ in range(num_layers)]
-        self.entropy_per_layer: List[List[float]] = [[] for _ in range(num_layers)]
-        self.expert_usage_per_task: Dict[str, List[List[float]]] = defaultdict(lambda: [[] for _ in range(num_experts)])
+    def clear(self):
+        """Clear all recorded data."""
+        E, L = self.num_experts, self.num_layers
+        # Token-weighted sums over REAL tokens (attention_mask), not means of batch means.
+        self._layer_wsum = np.zeros((L, E))
+        self._layer_tokens = np.zeros(L)
+        self._layer_entropy_sum = np.zeros(L)
+        self._task_layer_wsum: Dict[str, np.ndarray] = defaultdict(lambda: np.zeros((L, E)))
+        self._task_layer_tokens: Dict[str, np.ndarray] = defaultdict(lambda: np.zeros(L))
         self.routing_decisions: List[Dict[str, Any]] = []
-
-        # NEW: Per-layer, per-task routing (for fine-grained analysis)
-        # Structure: task -> layer -> list of [num_experts] arrays
-        self.expert_usage_per_task_per_layer: Dict[str, List[List[np.ndarray]]] = defaultdict(
-            lambda: [[] for _ in range(num_layers)]
-        )
-
         # Token-level routing (for visualization)
         self.token_routings: List[Dict[str, Any]] = []
 
@@ -62,96 +61,87 @@ class RoutingAnalyzer:
         self,
         gate_weights: torch.Tensor,
         layer_idx: int,
-        task_id: Optional[str] = None,
+        task_id: Optional[Any] = None,
         tokens: Optional[List[str]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ):
         """
         Record routing decision for analysis.
 
         Args:
-            gate_weights: [batch, seq_len, num_experts] routing weights
+            gate_weights: [batch, seq_len, num_experts] routing weights (incl. padding)
             layer_idx: Which transformer layer
-            task_id: Optional task identifier for multi-task analysis
-            tokens: Optional list of tokens for visualization
+            task_id: task of the whole batch (str) or one task per row (list)
+            tokens: Optional list of tokens (first row) for visualization
+            attention_mask: [batch, seq_len]; padding positions are excluded
         """
-        # Move to CPU and convert to numpy (float32 since numpy doesn't support bfloat16)
-        weights = gate_weights.detach().cpu().float().numpy()
+        # float32 numpy (numpy has no bfloat16)
+        weights = gate_weights.detach().float().cpu().numpy()
+        if weights.ndim == 2:  # [B, E] pooled routing
+            weights = weights[:, None, :]
+        B, T, _ = weights.shape
+        if attention_mask is None:
+            mask = np.ones((B, T))
+        else:
+            mask = attention_mask.detach().float().cpu().numpy()[:, :T]
+            if mask.shape != (B, T):
+                raise ValueError(f"gate_weights {weights.shape} vs attention_mask {mask.shape}")
 
-        # Expert usage for this batch
-        batch_expert_usage = weights.mean(axis=(0, 1))  # [num_experts]
-        self.expert_usage_per_layer[layer_idx].append(batch_expert_usage)
-
-        # Entropy
+        row_wsum = (weights * mask[..., None]).sum(axis=1)  # [B, E]
+        row_tokens = mask.sum(axis=1)  # [B]
         eps = 1e-8
-        entropy = -np.sum(weights * np.log(weights + eps), axis=-1).mean()
-        self.entropy_per_layer[layer_idx].append(entropy)
+        tok_entropy = -np.sum(weights * np.log(weights + eps), axis=-1)  # [B, T]
 
-        # Per-task usage (aggregated)
+        self._layer_wsum[layer_idx] += row_wsum.sum(axis=0)
+        self._layer_tokens[layer_idx] += row_tokens.sum()
+        self._layer_entropy_sum[layer_idx] += (tok_entropy * mask).sum()
+
         if task_id is not None:
-            for expert_idx in range(self.num_experts):
-                self.expert_usage_per_task[task_id][expert_idx].append(
-                    batch_expert_usage[expert_idx]
-                )
-            # NEW: Per-task, per-layer usage
-            self.expert_usage_per_task_per_layer[task_id][layer_idx].append(
-                batch_expert_usage
-            )
+            row_tasks = [task_id] * B if isinstance(task_id, str) else list(task_id)
+            for r, t in enumerate(row_tasks):
+                self._task_layer_wsum[t][layer_idx] += row_wsum[r]
+                self._task_layer_tokens[t][layer_idx] += row_tokens[r]
 
-        # Token-level routing (store first example for visualization)
+        # Token-level routing (first row, real tokens only)
         if tokens is not None and len(self.token_routings) < 100:
+            n_real = int(mask[0].sum())
             self.token_routings.append({
-                "tokens": tokens[:50],  # Limit tokens
-                "weights": weights[0, :50, :].tolist(),  # First batch item
+                "tokens": tokens[:min(50, n_real)],
+                "weights": weights[0, :min(50, n_real), :].tolist(),
                 "layer_idx": layer_idx,
-                "task_id": task_id,
+                "task_id": row_tasks[0] if task_id is not None else None,
             })
 
     def get_layer_expert_usage(self) -> np.ndarray:
         """
-        Get aggregated expert usage per layer.
+        Get aggregated expert usage per layer (mean over real tokens).
 
         Returns:
             Array of shape [num_layers, num_experts]
         """
-        usage = np.zeros((self.num_layers, self.num_experts))
-
-        for layer_idx in range(self.num_layers):
-            if self.expert_usage_per_layer[layer_idx]:
-                usage[layer_idx] = np.mean(self.expert_usage_per_layer[layer_idx], axis=0)
-
-        return usage
+        denom = np.maximum(self._layer_tokens, 1.0)[:, None]
+        return self._layer_wsum / denom
 
     def get_layer_entropy(self) -> np.ndarray:
         """
-        Get average routing entropy per layer.
+        Get average per-token routing entropy per layer (real tokens only).
 
         Returns:
             Array of shape [num_layers]
         """
-        entropy = np.zeros(self.num_layers)
-
-        for layer_idx in range(self.num_layers):
-            if self.entropy_per_layer[layer_idx]:
-                entropy[layer_idx] = np.mean(self.entropy_per_layer[layer_idx])
-
-        return entropy
+        return self._layer_entropy_sum / np.maximum(self._layer_tokens, 1.0)
 
     def get_task_expert_usage(self) -> Dict[str, np.ndarray]:
         """
-        Get expert usage breakdown per task.
+        Get expert usage breakdown per task (mean over layers that saw the task).
 
         Returns:
             Dict mapping task_id -> [num_experts] usage array
         """
         result = {}
-
-        for task_id, expert_lists in self.expert_usage_per_task.items():
-            task_usage = np.zeros(self.num_experts)
-            for expert_idx, values in enumerate(expert_lists):
-                if values:
-                    task_usage[expert_idx] = np.mean(values)
-            result[task_id] = task_usage
-
+        for task_id, layer_usage in self.get_task_layer_expert_usage().items():
+            seen = self._task_layer_tokens[task_id] > 0
+            result[task_id] = layer_usage[seen].mean(axis=0) if seen.any() else np.zeros(self.num_experts)
         return result
 
     def get_task_layer_expert_usage(self) -> Dict[str, np.ndarray]:
@@ -161,16 +151,10 @@ class RoutingAnalyzer:
         Returns:
             Dict mapping task_id -> [num_layers, num_experts] usage array
         """
-        result = {}
-
-        for task_id, layer_lists in self.expert_usage_per_task_per_layer.items():
-            task_layer_usage = np.zeros((self.num_layers, self.num_experts))
-            for layer_idx, usage_list in enumerate(layer_lists):
-                if usage_list:
-                    task_layer_usage[layer_idx] = np.mean(usage_list, axis=0)
-            result[task_id] = task_layer_usage
-
-        return result
+        return {
+            task_id: wsum / np.maximum(self._task_layer_tokens[task_id], 1.0)[:, None]
+            for task_id, wsum in self._task_layer_wsum.items()
+        }
 
     def compute_per_layer_task_specialization(self) -> Dict[str, Any]:
         """
@@ -233,7 +217,11 @@ class RoutingAnalyzer:
         Returns:
             Dict with specialization metrics
         """
-        layer_usage = self.get_layer_expert_usage()
+        observed = self._layer_tokens > 0  # skip non-gated / unseen layers
+        if not observed.any():
+            return {"load_imbalance": 0.0, "expert_variance": 0.0, "avg_dominance": 0.0,
+                    "max_dominance": 0.0, "task_specialization_score": 0.0, "num_observed_layers": 0}
+        layer_usage = self.get_layer_expert_usage()[observed]
 
         # Load imbalance (std of usage across experts)
         load_imbalance = np.std(layer_usage, axis=1).mean()
@@ -254,6 +242,7 @@ class RoutingAnalyzer:
             "avg_dominance": float(avg_dominance),
             "max_dominance": float(dominant_ratios.max()),
             "task_specialization_score": float(task_specialization),
+            "num_observed_layers": int(observed.sum()),
         }
 
     def compute_task_specialization_score(self) -> float:
@@ -328,14 +317,6 @@ class RoutingAnalyzer:
             json.dump(analysis, f, indent=2)
 
         logger.info(f"Saved routing analysis to {path}")
-
-    def clear(self):
-        """Clear all recorded data."""
-        self.expert_usage_per_layer = [[] for _ in range(self.num_layers)]
-        self.entropy_per_layer = [[] for _ in range(self.num_layers)]
-        self.expert_usage_per_task = defaultdict(lambda: [[] for _ in range(self.num_experts)])
-        self.routing_decisions = []
-        self.token_routings = []
 
 
 class RoutingVisualizer:
@@ -696,110 +677,83 @@ def analyze_model_routing(
     model,
     dataloader,
     tokenizer,
-    num_batches: int = 10,
+    num_batches: Optional[int] = None,
     output_dir: str = "./visualizations",
     experiment_name: str = "gated_lora",
+    autocast_dtype: Optional[torch.dtype] = None,
 ) -> Dict[str, Any]:
     """
     Run routing analysis on a trained gated LoRA model.
 
     Args:
-        model: Trained GatedLoRAModel
-        dataloader: DataLoader with evaluation data
+        model: Trained GatedLoRAModelV2
+        dataloader: DataLoader (ideally DATA's task-balanced loader)
         tokenizer: Tokenizer for decoding tokens
-        num_batches: Number of batches to analyze
+        num_batches: Max number of batches to analyze (None = whole loader)
         output_dir: Where to save visualizations
         experiment_name: Name for the experiment
+        autocast_dtype: fp16/bf16 autocast dtype (None = no autocast)
 
     Returns:
         Dict with analysis results
     """
+    import contextlib
+
     device = next(model.parameters()).device
 
-    # Determine model structure
-    num_experts = getattr(model, "num_experts", 3)
-    num_layers = getattr(model, "num_layers", 32)
+    num_experts = int(getattr(model, "num_experts"))
+    num_layers = int(getattr(model, "num_layers"))
 
     analyzer = RoutingAnalyzer(num_experts=num_experts, num_layers=num_layers)
+    analyzer.expert_ranks = getattr(model, "expert_ranks", None)
     visualizer = RoutingVisualizer(output_dir=output_dir)
 
+    use_autocast = autocast_dtype is not None and device.type == "cuda"
+    ctx = torch.autocast("cuda", dtype=autocast_dtype) if use_autocast else contextlib.nullcontext()
+    prev_collect = getattr(model, "collect_routing_stats", None)
+    if prev_collect is not None:
+        model.collect_routing_stats = True
+    was_training = model.training
     model.eval()
 
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(dataloader):
-            if batch_idx >= num_batches:
-                break
+    try:
+        with torch.no_grad(), ctx:
+            for batch_idx, batch in enumerate(dataloader):
+                if num_batches is not None and batch_idx >= num_batches:
+                    break
 
-            # Move to device
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch.get("attention_mask", None)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch.get("attention_mask", None)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device)
 
-            # Forward pass to get routing info
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                return_routing_info=True,
-            )
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_routing_info=True,
+                )
+                routing_info = outputs.get("routing_info") if isinstance(outputs, dict) else None
+                if not routing_info:
+                    continue
 
-            # Extract routing info
-            if isinstance(outputs, dict) and "routing_info" in outputs:
-                routing_info = outputs["routing_info"]
-
-                # Get tasks for all samples in batch
                 batch_tasks = batch.get("task", None)
-
-                # Decode tokens for visualization (first sample)
                 tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
-
-                # Check for per_layer_info (from GatedLoRAModelV2)
-                if "per_layer_info" in routing_info:
-                    per_layer_info = routing_info["per_layer_info"]
-                    # Record routing for each layer
-                    for layer_idx, layer_info in per_layer_info.items():
-                        if "gate_weights" in layer_info:
-                            gate_weights = layer_info["gate_weights"]
-                            layer_idx_int = int(layer_idx) if isinstance(layer_idx, str) else layer_idx
-
-                            # Record per-task routing (for each sample in batch)
-                            if batch_tasks is not None:
-                                for sample_idx, task_id in enumerate(batch_tasks):
-                                    # Extract this sample's gate weights
-                                    sample_weights = gate_weights[sample_idx:sample_idx+1]
-                                    analyzer.record_routing(
-                                        sample_weights,
-                                        layer_idx=layer_idx_int,
-                                        task_id=task_id,
-                                        tokens=tokens if (layer_idx_int == num_layers // 2 and sample_idx == 0) else None,
-                                    )
-                            else:
-                                # No task info, record whole batch
-                                analyzer.record_routing(
-                                    gate_weights,
-                                    layer_idx=layer_idx_int,
-                                    task_id=None,
-                                    tokens=tokens if layer_idx_int == num_layers // 2 else None,
-                                )
-                # Fallback: direct gate_weights
-                elif "gate_weights" in routing_info:
-                    gate_weights = routing_info["gate_weights"]
-                    if batch_tasks is not None:
-                        for sample_idx, task_id in enumerate(batch_tasks):
-                            sample_weights = gate_weights[sample_idx:sample_idx+1]
-                            analyzer.record_routing(
-                                sample_weights,
-                                layer_idx=num_layers // 2,
-                                task_id=task_id,
-                                tokens=tokens if sample_idx == 0 else None,
-                            )
-                    else:
-                        analyzer.record_routing(
-                            gate_weights,
-                            layer_idx=num_layers // 2,
-                            task_id=None,
-                            tokens=tokens,
-                        )
+                per_layer_info = routing_info.get("per_layer_info", {})
+                for layer_idx, layer_info in per_layer_info.items():
+                    if layer_info.get("uniform") or "gate_weights" not in layer_info:
+                        continue
+                    layer_idx_int = int(layer_idx)
+                    analyzer.record_routing(
+                        layer_info["gate_weights"],
+                        layer_idx=layer_idx_int,
+                        task_id=batch_tasks,
+                        tokens=tokens if layer_idx_int == num_layers // 2 else None,
+                        attention_mask=attention_mask,
+                    )
+    finally:
+        if prev_collect is not None:
+            model.collect_routing_stats = prev_collect
+        model.train(was_training)
 
     # Create visualizations
     visualizer.create_full_report(analyzer, experiment_name=experiment_name)

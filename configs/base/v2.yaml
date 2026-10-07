@@ -1,0 +1,38 @@
+# v2 defaults (docs/v2_contract.md). Put LAST in `extends` after models/ + tasks/ files
+# so it overrides the legacy training block of the model YAMLs.
+model:
+  # Pinned (not auto): every arm must train with the same numerics whatever the partition.
+  # fp16 validated on Qwen2.5-0.5B (job 59302: no overflow, GradScaler stable).
+  precision: fp16
+  gate_output_scale: num_experts
+  gate_reg_warmup_ratio: 0.1
+  use_layer_embedding: false   # only meaningful with per_layer_gating: false
+data:
+  data_format: v2
+  answer_only_loss: true
+  val_fraction: 0.05
+  # Cap per task (seeded subset). 5000 steps x 32 = 160k draws ~ 1 pass over the ~150k capped
+  # examples; small tasks still repeat (GSM8K ~7.1k train: ~3.4 passes, CSQA ~9.2k: ~2.4).
+  max_samples_per_task: 20000
+  sort_within_step: true       # length-sort inside each optimizer step (task mix unchanged)
+  max_val_samples: 500         # explicit: otherwise the CLI mirrors the train cap
+  max_final_samples: 1000      # per task on the official split (IMDB test alone is 25k)
+  length_bucketing: false
+training:
+  # 5000 x 32 sequences = 160k samples (legacy: 4 epochs x 40k)
+  max_steps: 5000
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.1
+  scheduler: cosine
+  save_steps: 500
+  eval_steps: 1000
+  eval_batch_size: 32
+  eval_samples_per_task_during_training: 250
+  collect_routing_stats: false
+  # Measured (job 59302, bs 8): keeping the base attention mask is FASTER (0.28 vs 0.32 s per
+  # micro-step) and lighter (10.4 vs 13.2 GB) than plain causal attention on sm_75: keep it.
+  skip_base_attention_mask: false
+  generation_tasks: [gsm8k, xsum]  # greedy final-number accuracy / ROUGE-L on the final split
+  generation_samples_per_task: 500

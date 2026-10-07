@@ -1,30 +1,47 @@
 """
-GatedLoRATrainer - Unified trainer combining 2-phase training, SLURM chaining,
-and periodic routing analysis.
+GatedLoRATrainer - unified trainer for PEFT LoRA baselines and Gated LoRA v2
+(docs/v2_contract.md).
 
 Features:
-1. Gating Warmup Phase: Freeze experts, train only gating network
-2. Joint Training Phase: Train both gating and experts
-3. Routing Statistics Logging: Expert usage, entropy, load imbalance
-4. Load Balancing Loss: Auxiliary loss for expert diversity
-5. Timer-based checkpointing for SLURM job chaining (4h partition limit)
-6. Resume from checkpoint with batch skipping
-7. Periodic Routing Analysis: per-layer, per-task routing snapshots during training
+1. Step budget (`max_steps`), gradient accumulation with leftovers carried
+   across epoch boundaries, exact-sample resume (`samples_seen`).
+2. Mixed precision: autocast fp16/bf16 + GradScaler (fp16), fp32 trainable
+   params and AdamW — same path for baseline and gated models.
+3. Evaluation: answer loss / answer token accuracy / teacher-forced exact match,
+   per task and overall; best model selected on the "val" mean task answer loss.
+4. Deadline-aware stopping (env GLR_DEADLINE, fallback max_runtime_seconds) for
+   SLURM job chaining; evals / routing analysis guarded by the same rule.
+5. Atomic local checkpoints (`latest/`, `best_model/`, `final_model/`) and
+   background HF Hub pushes (final push blocking, TRAINING_DONE verified).
+6. Periodic routing analysis (gated models): per-layer, per-task usage averaged
+   over real tokens, on a task-balanced loader.
 """
+
+import concurrent.futures
+import contextlib
+import json
+import logging
+import math
+import os
+import random
+import shutil
+import signal
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from typing import Dict, Optional, Any, List, Tuple
-import logging
-import sys
-import time
-from pathlib import Path
-from dataclasses import dataclass, field
-import json
-import math
-import os
-import re
+
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
 
 try:
     from tqdm import tqdm
@@ -40,12 +57,15 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Default max runtime: 3h30 (leaving 30min margin for 4h SLURM limit).
-# Override per-job with env GLR_MAX_RUNTIME_SECONDS (set by train.sbatch)
-# so partitions with different MaxTime don't need a code change.
+_EVAL_CE_CHUNK = 2048  # rows per fp32 cross-entropy chunk in evaluate()
+
+# Fallback runtime budget when GLR_DEADLINE is unset: 3h30 (4h SLURM limit).
+# Override per-job with env GLR_MAX_RUNTIME_SECONDS (set by train.sbatch).
 DEFAULT_MAX_RUNTIME_SECONDS = float(
     os.environ.get("GLR_MAX_RUNTIME_SECONDS", 3.5 * 3600)
 )
+
+TRAINING_DONE = "TRAINING_DONE"
 
 
 def setup_logging_to_stdout():
@@ -70,15 +90,18 @@ def setup_logging_to_stdout():
 
 @dataclass
 class TrainingState:
-    """Tracks training progress."""
-    global_step: int = 0
-    epoch: int = 0
-    batch_idx: int = 0  # NEW: batch index within current epoch for resume
-    best_eval_loss: float = float("inf")
-    warmup_completed: bool = False
+    """Tracks training progress (serialised to latest/training_state.json)."""
+    global_step: int = 0  # optimizer steps taken
+    epoch: int = 0  # current data epoch
+    batch_idx: int = 0  # micro-batches consumed in the current epoch (informational)
+    samples_seen: int = 0  # samples consumed in the current epoch (= resume skip_samples)
+    total_samples_seen: int = 0
+    best_eval_loss: float = float("inf")  # "val" mean task answer loss
+    best_eval_step: int = -1
+    last_eval_step: int = -1
     total_train_loss: float = 0.0
     total_lb_loss: float = 0.0  # Load balancing loss
-    num_train_steps: int = 0
+    num_train_steps: int = 0  # micro-batches accounted in total_train_loss
 
 
 @dataclass
@@ -90,904 +113,1126 @@ class RoutingSnapshot:
     task_layer_expert_usage: Dict[str, List[List[float]]]  # {task: [num_layers, num_experts]}
     layer_entropy: List[float]  # [num_layers]
     specialization_scores: Dict[str, float]  # per-layer specialization scores
+    observed_layers: List[int] = field(default_factory=list)  # layers with real (gated) routing
 
+
+# =============================================================================
+# Small helpers
+# =============================================================================
+
+def _out(outputs: Any, key: str) -> Any:
+    """Read a field from a dict output (gated) or a ModelOutput (PEFT)."""
+    if isinstance(outputs, dict):
+        return outputs.get(key)
+    return getattr(outputs, key, None)
+
+
+def _make_grad_scaler(enabled: bool):
+    try:
+        from torch.amp import GradScaler
+        return GradScaler("cuda", enabled=enabled)
+    except (ImportError, TypeError):
+        from torch.cuda.amp import GradScaler
+        return GradScaler(enabled=enabled)
+
+
+def _rng_state() -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "python": [random.getstate()[0], list(random.getstate()[1]), random.getstate()[2]],
+        "torch": torch.get_rng_state().tolist(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = [s.tolist() for s in torch.cuda.get_rng_state_all()]
+    if NUMPY_AVAILABLE:
+        name, keys, pos, has_gauss, cached = np.random.get_state()
+        state["numpy"] = [name, keys.tolist(), int(pos), int(has_gauss), float(cached)]
+    return state
+
+
+def _set_rng_state(state: Dict[str, Any]) -> None:
+    if "python" in state:
+        v, internal, gauss = state["python"]
+        random.setstate((v, tuple(internal), gauss))
+    if "torch" in state:
+        torch.set_rng_state(torch.tensor(state["torch"], dtype=torch.uint8))
+    if "cuda" in state and torch.cuda.is_available():
+        cuda_states = [torch.tensor(s, dtype=torch.uint8) for s in state["cuda"]]
+        if len(cuda_states) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(cuda_states)
+        else:
+            logger.warning("CUDA RNG state not restored: device count changed")
+    if "numpy" in state and NUMPY_AVAILABLE:
+        name, keys, pos, has_gauss, cached = state["numpy"]
+        np.random.set_state((name, np.array(keys, dtype=np.uint32), pos, has_gauss, cached))
+
+
+def _link_or_copy(src: str, dst: str) -> None:
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+class _HubPusher:
+    """HF Hub uploads: one at a time on a background thread, blocking on demand.
+
+    Uploads a hard-link snapshot of the directory so that a concurrent atomic
+    re-save of e.g. best_model/ cannot change files under the uploader.
+    Repo layout matches scripts/transfer/ensimag_push.py: <repo>/<run>/<dir>/.
+    """
+
+    RETRIES = 4
+
+    def __init__(self, output_dir: Path, repo: str, run_name: str, enabled: bool):
+        self.output_dir = output_dir
+        self.repo = repo
+        self.run_name = run_name
+        self.enabled = enabled
+        self._pending: Dict[str, concurrent.futures.Future] = {}
+        self._executor = (
+            concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="hf-push")
+            if enabled else None
+        )
+        self._api = None
+
+    def api(self):
+        if self._api is None:
+            from huggingface_hub import HfApi
+            self._api = HfApi(token=os.environ.get("HF_TOKEN"))
+        return self._api
+
+    def _retry(self, what: str, fn: Callable[[], Any]) -> None:
+        delay = 15.0
+        for attempt in range(1, self.RETRIES + 1):
+            try:
+                fn()
+                return
+            except Exception as exc:
+                if attempt == self.RETRIES:
+                    raise
+                logger.warning(f"[hf-push] {what} failed (attempt {attempt}/{self.RETRIES}): "
+                               f"{type(exc).__name__}: {exc}; retrying in {delay:.0f}s")
+                time.sleep(delay)
+                delay *= 2
+
+    def _upload_snapshot(self, snap: Path, name: str) -> bool:
+        path_in_repo = f"{self.run_name}/{name}"
+        try:
+            self._retry(path_in_repo, lambda: self.api().upload_folder(
+                folder_path=str(snap),
+                repo_id=self.repo,
+                repo_type="dataset",
+                path_in_repo=path_in_repo,
+                commit_message=f"Sync {path_in_repo}",
+            ))
+            logger.info(f"[hf-push] uploaded {path_in_repo}")
+            return True
+        except Exception:
+            logger.exception(f"[hf-push] FAILED to upload {path_in_repo} (training continues)")
+            return False
+        finally:
+            shutil.rmtree(snap, ignore_errors=True)
+
+    def submit_dir(self, name: str, blocking: bool = False) -> bool:
+        """Push output_dir/<name>/. Non-blocking unless `blocking`. Returns False if
+        skipped (disabled / missing / same dir still uploading and not blocking)."""
+        if not self.enabled:
+            return False
+        src = self.output_dir / name
+        if not src.is_dir():
+            return False
+        prev = self._pending.get(name)
+        if prev is not None and not prev.done():
+            if not blocking:
+                logger.info(f"[hf-push] {name} still uploading, skip this push")
+                return False
+            prev.result()
+        snap = self.output_dir / ".push" / f"{name}-{time.time_ns()}"
+        snap.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, snap, copy_function=_link_or_copy)
+        fut = self._executor.submit(self._upload_snapshot, snap, name)
+        self._pending[name] = fut
+        if blocking:
+            return bool(fut.result())
+        return True
+
+    def upload_file(self, local: Path, verify: bool = False) -> bool:
+        """Blocking single-file upload (+ optional existence check)."""
+        if not self.enabled or not local.is_file():
+            return False
+        path_in_repo = f"{self.run_name}/{local.name}"
+
+        def _do():
+            self.api().upload_file(
+                path_or_fileobj=str(local),
+                path_in_repo=path_in_repo,
+                repo_id=self.repo,
+                repo_type="dataset",
+                commit_message=f"Sync {path_in_repo}",
+            )
+            if verify and not self.api().file_exists(self.repo, path_in_repo, repo_type="dataset"):
+                raise RuntimeError(f"{path_in_repo} not visible on the Hub after upload")
+
+        try:
+            self._retry(path_in_repo, _do)
+            logger.info(f"[hf-push] uploaded {path_in_repo}")
+            return True
+        except Exception:
+            logger.exception(f"[hf-push] FAILED to upload {path_in_repo}")
+            return False
+
+    def wait(self) -> None:
+        for fut in list(self._pending.values()):
+            fut.result()
+
+    def shutdown(self) -> None:
+        if self._executor is not None:
+            self.wait()
+            self._executor.shutdown(wait=True)
+            self._executor = None
+            self.enabled = False
+
+
+# =============================================================================
+# Trainer
+# =============================================================================
 
 class GatedLoRATrainer:
     """
-    Custom trainer for Gated LoRA with:
-    - 2-phase training (gating warmup → joint)
-    - Routing statistics logging
-    - Load balancing loss
-    - Timer-based checkpointing for SLURM job chaining
-    - Resume from checkpoint with batch skipping
+    Trainer for Gated LoRA v2 and PEFT LoRA baselines with:
+    - step budget, grad accumulation carried across epochs, exact resume
+    - mixed precision (autocast + GradScaler for fp16)
+    - answer-level evaluation, best model on val mean task answer loss
+    - deadline-aware stopping + atomic checkpoints + HF push for SLURM chaining
+    - periodic routing analysis (gated models)
     """
 
     def __init__(
         self,
         model: nn.Module,
-        train_dataloader: DataLoader,
-        eval_dataloader: Optional[DataLoader] = None,
+        data: Any = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[Any] = None,
         config: Optional[Any] = None,
         output_dir: str = "./outputs",
         device: str = "cuda",
-        max_runtime_seconds: float = DEFAULT_MAX_RUNTIME_SECONDS,  # NEW
+        max_runtime_seconds: float = DEFAULT_MAX_RUNTIME_SECONDS,
+        max_steps: Optional[int] = None,
+        precision: Optional[str] = None,
     ):
+        from gated_lora.training.config import resolve_precision
+
         self.model = model
-        self.train_dataloader = train_dataloader
-        self.eval_dataloader = eval_dataloader
+        self.data = data  # MultiTaskDatasetLoader (DATA owner)
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
-        self.max_runtime_seconds = max_runtime_seconds  # NEW
+        self.max_runtime_seconds = max_runtime_seconds
 
-        # Training state
         self.state = TrainingState()
 
-        # Extract config values
-        self.num_epochs = getattr(config.training, "num_epochs", 4) if config else 4
-        self.gating_warmup_steps = getattr(config.training, "gating_warmup_steps", 0) if config else 0
-        self.gating_warmup_epochs = getattr(config.training, "gating_warmup_epochs", 0) if config else 0
-        self.freeze_experts_during_warmup = getattr(config.training, "freeze_experts_during_warmup", True) if config else True
-        self.use_load_balancing = getattr(config.model, "use_load_balancing", False) if config else False
-        self.load_balancing_weight = getattr(config.model, "load_balancing_weight", 0.001) if config else 0.001
-        self.log_routing_stats = getattr(config.training, "log_routing_stats", True) if config else True
-        self.logging_steps = getattr(config.training, "logging_steps", 10) if config else 10
-        self.eval_steps = getattr(config.training, "eval_steps", 500) if config else 500
-        self.save_steps = getattr(config.training, "save_steps", 500) if config else 500
-        self.gradient_accumulation_steps = getattr(config.training, "gradient_accumulation_steps", 1) if config else 1
-        self.max_grad_norm = getattr(config.training, "max_grad_norm", 1.0) if config else 1.0
+        tc = config.training if config else None
 
-        # Routing statistics accumulator
-        self.routing_stats_buffer: List[Dict[str, float]] = []
+        def _t(name, default):
+            return getattr(tc, name, default) if tc is not None else default
 
-        # Check if model is gated
-        self.is_gated = hasattr(model, "gating_network") or hasattr(model, "is_gated")
+        self.num_epochs = _t("num_epochs", 4)
+        self.batch_size = _t("batch_size", 4)
+        self.max_steps = int(max_steps if max_steps is not None else _t("max_steps", -1))
+        if self.max_steps <= 0:
+            raise ValueError("GatedLoRATrainer needs max_steps > 0 (pipeline.compute_max_steps)")
+        self.seed = config.run_seed if config is not None else 42
+        self.log_routing_stats = _t("log_routing_stats", True)
+        self.collect_routing_stats = _t("collect_routing_stats", False)
+        self.logging_steps = _t("logging_steps", 10)
+        self.eval_steps = _t("eval_steps", 1000)
+        self.eval_batch_size = _t("eval_batch_size", 32)
+        self.eval_samples_per_task = _t("eval_samples_per_task_during_training", 250)
+        self.save_steps = _t("save_steps", 500)
+        self.save_margin = float(_t("save_margin_seconds", 300.0))
+        self.gradient_accumulation_steps = _t("gradient_accumulation_steps", 1)
+        self.max_grad_norm = _t("max_grad_norm", 1.0)
+        self.routing_analysis_steps = _t("routing_analysis_steps", 500)
+        self.routing_analysis_samples_per_task = _t("routing_analysis_samples_per_task", 32)
+        # Exact only for right-padded batches (our collator): plain causal attention, no 4D mask
+        self.skip_base_attention_mask = bool(_t("skip_base_attention_mask", False))
+        self.generation_tasks = list(_t("generation_tasks", []) or [])
+        self.generation_samples_per_task = int(_t("generation_samples_per_task", 500))
+        self.generation_batch_size = int(_t("generation_batch_size", 32))
+        dc = config.data if config else None
+        self.sort_window = (self.batch_size * self.gradient_accumulation_steps
+                            if dc is not None and getattr(dc, "sort_within_step", False) else 0)
+        # Test hook (validate_v2.sbatch): stop like a deadline once global_step reaches it
+        self.stop_at_step = int(os.environ.get("GLR_STOP_AT_STEP", "0") or 0)
+        self.gate_reg_warmup_steps = (
+            getattr(config.model, "gate_reg_warmup_ratio", 0.0) * self.max_steps if config else 0.0
+        )
+        if _t("gating_warmup_steps", 0) > 0 or _t("gating_warmup_epochs", 0) > 0:
+            raise ValueError("Gating warmup was removed in v2 (experts are zero-initialised)")
 
-        # NEW: Periodic routing analysis for convergence study
-        self.routing_analysis_steps = getattr(config.training, "routing_analysis_steps", 500) if config else 500
+        # Is the model gated? (PeftModel forwards unknown attrs to the base model,
+        # which has no gating_network, so baselines resolve to False.)
+        self.is_gated = hasattr(model, "gating_network") or bool(getattr(model, "is_gated", False))
+
+        # Mixed precision
+        self.precision = precision or resolve_precision(
+            getattr(config.model, "precision", "auto") if config else "auto"
+        )
+        self._on_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+        self.autocast_dtype = (
+            {"fp16": torch.float16, "bf16": torch.bfloat16}.get(self.precision)
+            if self._on_cuda else None
+        )
+        self.scaler = _make_grad_scaler(enabled=self.precision == "fp16" and self._on_cuda)
+        self.trainable_params = [p for p in model.parameters() if p.requires_grad]
+        # Project only supervised positions to the vocabulary (see models/selective_head.py)
+        from gated_lora.models.selective_head import install_selective_head
+        try:
+            hf_model = model.model if self.is_gated else model.get_base_model()
+            self._head = install_selective_head(hf_model)
+        except (AttributeError, ValueError) as e:  # e.g. test doubles without an HF head
+            logger.warning(f"Selective output head not installed ({e}): full-sequence logits")
+            self._head = None
+        non_fp32 = [p.dtype for p in self.trainable_params if p.dtype != torch.float32]
+        if non_fp32:
+            raise ValueError(f"{len(non_fp32)} trainable params are not fp32 ({set(non_fp32)}); "
+                             f"AdamW must run on fp32 params")
+
+        # Routing statistics accumulator (detached GPU tensors; synced at logging)
+        self.routing_stats_buffer: List[Dict[str, torch.Tensor]] = []
         self.routing_history: List[RoutingSnapshot] = []
-        self.analysis_dataloader = None  # Will be set if multi-task data available
+        self.routing_analysis_failures = 0
+        self.analysis_dataloader = None  # lazily built from DATA's balanced loader
 
-        logger.info(f"GatedLoRATrainer initialized:")
-        if self.gating_warmup_epochs > 0:
-            logger.info(f"  - Gating warmup: {self.gating_warmup_epochs} epoch(s)")
-        else:
-            logger.info(f"  - Gating warmup: {self.gating_warmup_steps} steps")
-        logger.info(f"  - Freeze experts during warmup: {self.freeze_experts_during_warmup}")
-        logger.info(f"  - Load balancing: {self.use_load_balancing} (weight={self.load_balancing_weight})")
+        # Eval loaders cache + timing estimates
+        self._eval_loaders: Dict[Tuple[str, Optional[int]], DataLoader] = {}
+        self._eval_sec_per_batch: Optional[float] = None
+        self.max_step_time = 0.0
+        self._first_step_time: Optional[float] = None
+        self.deadline: Optional[float] = None
+        self._term_requested = False
+        self._tok_real = 0
+        self._tok_total = 0
+
+        # HF push (only when configured AND HF_TOKEN present)
+        hub_repo = os.environ.get("GLR_HF_REPO") or _t("hub_repo", "Helain/gated-lora-experiments")
+        run_name = os.environ.get("GLR_RUN_NAME") or self.output_dir.name
+        push_enabled = bool(_t("push_to_hub", True)) and bool(os.environ.get("HF_TOKEN"))
+        if _t("push_to_hub", True) and not push_enabled:
+            logger.warning("HF_TOKEN unset: HF Hub push disabled")
+        self.pusher = _HubPusher(self.output_dir, hub_repo, run_name, push_enabled)
+        self._best_dirty = False
+        self._last_best_push_step: Optional[int] = None
+
+        logger.info("GatedLoRATrainer initialized:")
         logger.info(f"  - Is gated model: {self.is_gated}")
-        logger.info(f"  - Max runtime: {self.max_runtime_seconds / 3600:.2f} hours")
+        logger.info(f"  - Budget: {self.max_steps} optimizer steps "
+                    f"(batch {self.batch_size} x accum {self.gradient_accumulation_steps})")
+        logger.info(f"  - Precision: {self.precision} (autocast={self.autocast_dtype}, "
+                    f"grad scaler={self.scaler.is_enabled()})")
+        logger.info(f"  - Eval every {self.eval_steps} steps on {self.eval_samples_per_task}/task "
+                    f"(batch {self.eval_batch_size})")
         logger.info(f"  - Routing analysis every: {self.routing_analysis_steps} steps")
+        logger.info(f"  - HF push: {push_enabled} ({hub_repo}/{run_name})")
+
+    # ------------------------------------------------------------------ utils
+
+    def _autocast(self):
+        if self.autocast_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast("cuda", dtype=self.autocast_dtype)
+
+    def _set_model_attr(self, name: str, value: Any) -> None:
+        """Set a MODEL-contract attribute (reg_scale, collect_routing_stats) if present."""
+        if self.is_gated and hasattr(self.model, name):
+            setattr(self.model, name, value)
+
+    def _to_device(self, t: torch.Tensor) -> torch.Tensor:
+        return t.to(self.device, non_blocking=True)
+
+    def _forward(self, batch: Dict[str, Any], with_labels: bool, routing_info: bool = False):
+        kwargs: Dict[str, Any] = {
+            "input_ids": self._to_device(batch["input_ids"]),
+            "attention_mask": self._to_device(batch["attention_mask"]),
+        }
+        if with_labels:
+            kwargs["labels"] = self._to_device(batch["labels"])
+        if self.is_gated:
+            if routing_info:
+                kwargs["return_routing_info"] = True
+            if self.skip_base_attention_mask:
+                kwargs["base_attention_mask"] = False  # hooks still get the mask
+        else:
+            kwargs["use_cache"] = False
+            if self.skip_base_attention_mask:
+                del kwargs["attention_mask"]
+        return self.model(**kwargs)
+
+    @contextlib.contextmanager
+    def logits_off(self):
+        """Forwards inside project ONE position to the vocabulary (logits unused: routing)."""
+        if self._head is None:
+            yield
+            return
+        self._head.index = torch.zeros(1, dtype=torch.long, device=self.device)
+        try:
+            yield
+        finally:
+            self._head.index = None
+
+    @staticmethod
+    def _supervised_positions(batch: Dict[str, Any], answer_only: bool):
+        """Flat [B*T] indices of positions whose NEXT token is supervised, their targets and rows.
+
+        Computed on the collate (CPU) tensors: no GPU sync.
+        """
+        key = "ans" if answer_only else "sup"
+        if f"{key}_flat" in batch:  # computed (and pinned) by the DATA collator
+            return batch[f"{key}_flat"], batch[f"{key}_tgt"], batch[f"{key}_rows"]
+        from gated_lora.data.multi_task_dataset import supervised_positions
+        return supervised_positions(batch["labels"],
+                                    batch.get("answer_mask") if answer_only else None)
+
+    def _forward_selected(self, batch: Dict[str, Any], answer_only: bool, routing_info: bool = False):
+        """Forward without labels; logits [N, V] only at the supervised positions."""
+        flat, tgt, rows = self._supervised_positions(batch, answer_only)
+        flat = self._to_device(flat)
+        if self._head is None:
+            outputs = self._forward(batch, with_labels=False, routing_info=routing_info)
+            logits = _out(outputs, "logits")
+            logits = logits.reshape(-1, logits.shape[-1]).index_select(0, flat)
+        else:
+            self._head.index = flat
+            try:
+                outputs = self._forward(batch, with_labels=False, routing_info=routing_info)
+            finally:
+                self._head.index = None
+            logits = _out(outputs, "logits")
+        return outputs, logits, self._to_device(tgt), self._to_device(rows)
+
+    # --------------------------------------------------------------- deadline
+
+    def _init_deadline(self) -> None:
+        env = os.environ.get("GLR_DEADLINE")
+        if env:
+            self.deadline = float(env)
+            logger.info(f"Deadline from GLR_DEADLINE: "
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.deadline))} "
+                        f"({(self.deadline - time.time()) / 60:.1f} min left)")
+        else:
+            self.deadline = time.time() + self.max_runtime_seconds
+            logger.info(f"GLR_DEADLINE unset: budget max_runtime_seconds="
+                        f"{self.max_runtime_seconds / 3600:.2f} h")
+
+    def _step_time_bound(self) -> float:
+        if self.max_step_time > 0:
+            return self.max_step_time
+        return self._first_step_time or 0.0
+
+    def time_allows(self, extra_seconds: float = 0.0) -> bool:
+        """True if `extra_seconds` of work still leaves 2 steps + save margin before the deadline."""
+        if self.deadline is None:
+            return True
+        return time.time() + extra_seconds + 2 * self._step_time_bound() + self.save_margin <= self.deadline
+
+    def _eval_seconds_estimate(self, loader: DataLoader) -> float:
+        try:
+            n = len(loader)
+        except TypeError:
+            return 0.0
+        per = self._eval_sec_per_batch
+        if per is None:
+            per = self._step_time_bound() / max(self.gradient_accumulation_steps, 1)
+        return n * per
+
+    def estimate_routing_analysis_seconds(self) -> float:
+        try:
+            return self._eval_seconds_estimate(self.get_analysis_dataloader())
+        except Exception:
+            return 0.0
+
+    # ------------------------------------------------------------------ data
+
+    def _train_loader(self) -> DataLoader:
+        return self.data.create_weighted_dataloader(
+            split="train",
+            batch_size=self.batch_size,
+            seed=self.seed,
+            epoch=self.state.epoch,
+            skip_samples=self.state.samples_seen,
+            sort_window=self.sort_window,
+        )
+
+    def _eval_loader(self, which: str, samples_per_task: Optional[int]) -> DataLoader:
+        key = (which, samples_per_task)
+        if key not in self._eval_loaders:
+            self._eval_loaders[key] = self.data.create_eval_dataloader(
+                which=which, batch_size=self.eval_batch_size, samples_per_task=samples_per_task,
+            )
+        return self._eval_loaders[key]
 
     def set_analysis_dataloader(self, dataloader: DataLoader):
-        """Set the dataloader used for periodic routing analysis."""
+        """Override the dataloader used for routing analysis (default: DATA balanced loader)."""
         self.analysis_dataloader = dataloader
         logger.info(f"Analysis dataloader set with {len(dataloader)} batches")
 
-    def _freeze_experts(self):
-        """Freeze LoRA expert parameters during gating warmup."""
-        if not self.is_gated:
-            return
+    def get_analysis_dataloader(self) -> DataLoader:
+        if self.analysis_dataloader is None:
+            self.analysis_dataloader = self.data.create_balanced_loader(
+                samples_per_task=self.routing_analysis_samples_per_task,
+                batch_size=self.eval_batch_size,
+            )
+        return self.analysis_dataloader
 
-        frozen_count = 0
-        if hasattr(self.model, "expert_pools"):
-            for pool in self.model.expert_pools:
-                for param in pool.parameters():
-                    param.requires_grad = False
-                    frozen_count += 1
-        elif hasattr(self.model, "lora_layers"):
-            for param in self.model.lora_layers.parameters():
-                param.requires_grad = False
-                frozen_count += 1
+    # --------------------------------------------------------- routing stats
 
-        logger.info(f"Froze {frozen_count} expert parameters for gating warmup")
-
-    def _unfreeze_experts(self):
-        """Unfreeze LoRA expert parameters after warmup."""
-        if not self.is_gated:
-            return
-
-        unfrozen_count = 0
-        if hasattr(self.model, "expert_pools"):
-            for pool in self.model.expert_pools:
-                for param in pool.parameters():
-                    param.requires_grad = True
-                    unfrozen_count += 1
-        elif hasattr(self.model, "lora_layers"):
-            for param in self.model.lora_layers.parameters():
-                param.requires_grad = True
-                unfrozen_count += 1
-
-        logger.info(f"Unfroze {unfrozen_count} expert parameters - starting joint training")
-
-    def _extract_routing_stats(self, outputs: Dict[str, Any]) -> Dict[str, float]:
-        """Extract routing statistics from model outputs."""
-        stats = {}
-
-        # Check for routing info in outputs
-        if "routing_info" in outputs:
-            routing_info = outputs["routing_info"]
-
-            # Expert usage
-            if "expert_usage" in routing_info:
-                usage = routing_info["expert_usage"]
-                if isinstance(usage, torch.Tensor):
-                    usage = usage.detach().cpu()
-                for i, u in enumerate(usage):
-                    stats[f"expert_{i}_usage"] = float(u)
-
-            # Entropy
-            if "entropy" in routing_info:
-                entropy = routing_info["entropy"]
-                if isinstance(entropy, torch.Tensor):
-                    entropy = entropy.detach().cpu().item()
-                stats["routing_entropy"] = float(entropy)
-
-            # Normalized entropy
-            if "normalized_entropy" in routing_info:
-                norm_ent = routing_info["normalized_entropy"]
-                if isinstance(norm_ent, torch.Tensor):
-                    norm_ent = norm_ent.detach().cpu().item()
-                stats["routing_normalized_entropy"] = float(norm_ent)
-
-            # Load imbalance
-            if "load_imbalance" in routing_info:
-                imb = routing_info["load_imbalance"]
-                if isinstance(imb, torch.Tensor):
-                    imb = imb.detach().cpu().item()
-                stats["load_imbalance"] = float(imb)
-
-            # Top-1 dominance
-            if "top1_dominance" in routing_info:
-                dom = routing_info["top1_dominance"]
-                if isinstance(dom, torch.Tensor):
-                    dom = dom.detach().cpu().item()
-                stats["top1_dominance"] = float(dom)
-
-        # Load balancing loss
-        if "load_balancing_loss" in outputs:
-            lb_loss = outputs["load_balancing_loss"]
-            if isinstance(lb_loss, torch.Tensor):
-                lb_loss = lb_loss.detach().cpu().item()
-            stats["load_balancing_loss"] = float(lb_loss)
-
+    def _extract_routing_stats(self, outputs: Any) -> Dict[str, torch.Tensor]:
+        """Detached routing statistics (no host sync; converted at logging time)."""
+        stats: Dict[str, torch.Tensor] = {}
+        routing_info = _out(outputs, "routing_info") or {}
+        for key, name in (("mean_entropy", "routing_entropy"),
+                          ("mean_top1_dominance", "top1_dominance")):
+            v = routing_info.get(key)
+            if isinstance(v, torch.Tensor):
+                stats[name] = v.detach().float().reshape(())
+            elif v is not None:
+                stats[name] = torch.tensor(float(v))
+        usage = routing_info.get("mean_expert_usage")
+        if isinstance(usage, torch.Tensor):
+            usage = usage.detach().float().reshape(-1)
+            for i, u in enumerate(usage):
+                stats[f"expert_{i}_usage"] = u
+            # load imbalance = std of expert usage across experts
+            stats["load_imbalance"] = usage.std(unbiased=False)
         return stats
 
     def _aggregate_routing_stats(self) -> Dict[str, float]:
-        """Aggregate buffered routing statistics."""
+        """Aggregate buffered routing statistics (single host sync)."""
         if not self.routing_stats_buffer:
             return {}
-
+        keys = list(self.routing_stats_buffer[0].keys())
         aggregated = {}
-        keys = self.routing_stats_buffer[0].keys()
-
         for key in keys:
-            values = [s[key] for s in self.routing_stats_buffer if key in s]
+            values = [s[key].to(self.device) for s in self.routing_stats_buffer if key in s]
             if values:
-                aggregated[f"avg_{key}"] = sum(values) / len(values)
-
+                aggregated[f"avg_{key}"] = torch.stack(values).mean()
         self.routing_stats_buffer.clear()
-        return aggregated
+        names = list(aggregated)
+        vals = torch.stack([aggregated[k] for k in names]).tolist() if names else []
+        return dict(zip(names, vals))
 
-    def run_routing_analysis(self, num_batches: int = 20) -> Optional[RoutingSnapshot]:
+    def run_routing_analysis(self, dataloader: Optional[DataLoader] = None) -> Optional[RoutingSnapshot]:
         """
-        Run detailed routing analysis and create a snapshot.
+        Per-layer, per-task routing snapshot on a task-balanced loader.
 
-        Args:
-            num_batches: Number of batches to analyze
-
-        Returns:
-            RoutingSnapshot with per-layer, per-task routing patterns
+        gate_weights are [batch, seq, experts]: usage = mean over (batch, real
+        tokens) using attention_mask; per task = mean over that task's real tokens.
+        Layers reporting uniform (non-gated) routing are excluded from
+        `observed_layers` and reported as uniform.
         """
-        if not self.is_gated or self.analysis_dataloader is None:
+        if not self.is_gated:
             return None
+        loader = dataloader or self.get_analysis_dataloader()
 
+        num_experts = int(getattr(self.model, "num_experts"))
+        num_layers = int(getattr(self.model, "num_layers"))
+
+        # per layer: list of ([B, E] weight sums over real tokens, [B] real-token counts)
+        per_layer: Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]] = {}
+        row_tasks: List[str] = []
+        prev_collect = getattr(self.model, "collect_routing_stats", None)
+        self._set_model_attr("collect_routing_stats", True)
         self.model.eval()
+        try:
+            with torch.no_grad(), self._autocast():
+                for batch in loader:
+                    with self.logits_off():
+                        outputs = self._forward(batch, with_labels=False, routing_info=True)
+                    mask = self._to_device(batch["attention_mask"]).float()
+                    tasks = list(batch.get("task") or ["all"] * mask.size(0))
+                    row_tasks.extend(tasks)
+                    pli = (_out(outputs, "routing_info") or {}).get("per_layer_info", {})
+                    for layer_key, info in pli.items():
+                        if info.get("uniform") or "gate_weights" not in info:
+                            continue
+                        layer_idx = int(layer_key)
+                        gw = info["gate_weights"].float()
+                        if gw.dim() == 2:  # [B, E] (pooled) -> one "token" per row
+                            gw, m = gw[:, None, :], torch.ones_like(mask[:, :1])
+                        else:
+                            m = mask
+                        if gw.shape[:2] != m.shape:
+                            raise ValueError(f"layer {layer_idx}: gate_weights {tuple(gw.shape)} "
+                                             f"vs attention_mask {tuple(m.shape)}")
+                        wsum = (gw * m.unsqueeze(-1)).sum(dim=1)  # [B, E]
+                        per_layer.setdefault(layer_idx, []).append((wsum, m.sum(dim=1)))
+                    # A layer missing from some batch would misalign rows -> fail loudly.
+                    for layer_idx, chunks in per_layer.items():
+                        if sum(c[1].numel() for c in chunks) != len(row_tasks):
+                            raise ValueError(f"layer {layer_idx} missing routing info in some batch")
+        finally:
+            self.model.train()
+            if prev_collect is not None:
+                self._set_model_attr("collect_routing_stats", prev_collect)
 
-        # Get model dimensions
-        num_experts = getattr(self.model, "num_experts", 3)
-        num_layers = getattr(self.model, "num_layers", 32)
+        uniform = [1.0 / num_experts] * num_experts
+        layer_usage = [list(uniform) for _ in range(num_layers)]
+        task_names = sorted(set(row_tasks))
+        task_usage: Dict[str, List[List[float]]] = {t: [list(uniform) for _ in range(num_layers)]
+                                                    for t in task_names}
+        observed = sorted(per_layer)
+        for layer_idx in observed:
+            W = torch.cat([c[0] for c in per_layer[layer_idx]]).cpu()  # [N, E]
+            C = torch.cat([c[1] for c in per_layer[layer_idx]]).cpu()  # [N]
+            total = C.sum().clamp(min=1.0)
+            layer_usage[layer_idx] = (W.sum(0) / total).tolist()
+            for t in task_names:
+                rows = torch.tensor([rt == t for rt in row_tasks])
+                ct = C[rows].sum()
+                if ct > 0:
+                    task_usage[t][layer_idx] = (W[rows].sum(0) / ct).tolist()
 
-        # Accumulators: layer_expert_counts[layer][expert] = count
-        layer_expert_counts = [[0.0] * num_experts for _ in range(num_layers)]
-        task_layer_expert_counts: Dict[str, List[List[float]]] = {}
-        total_samples = 0
-        task_samples: Dict[str, int] = {}
-
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(self.analysis_dataloader):
-                if batch_idx >= num_batches:
-                    break
-
-                # Move to device
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch.get("attention_mask")
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(self.device)
-
-                batch_tasks = batch.get("task", None)
-                batch_size = input_ids.size(0)
-                total_samples += batch_size
-
-                # Forward with routing info
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    return_routing_info=True,
-                )
-
-                if isinstance(outputs, dict) and "routing_info" in outputs:
-                    routing_info = outputs["routing_info"]
-
-                    if "per_layer_info" in routing_info:
-                        per_layer_info = routing_info["per_layer_info"]
-
-                        for layer_idx_key, layer_info in per_layer_info.items():
-                            layer_idx = int(layer_idx_key) if isinstance(layer_idx_key, str) else layer_idx_key
-
-                            if "gate_weights" in layer_info:
-                                gate_weights = layer_info["gate_weights"]  # [batch, num_experts]
-
-                                # Aggregate per-layer
-                                mean_weights = gate_weights.mean(dim=0).cpu().tolist()
-                                for e, w in enumerate(mean_weights):
-                                    layer_expert_counts[layer_idx][e] += w * batch_size
-
-                                # Aggregate per-task
-                                if batch_tasks is not None:
-                                    for sample_idx, task in enumerate(batch_tasks):
-                                        if task not in task_layer_expert_counts:
-                                            task_layer_expert_counts[task] = [[0.0] * num_experts for _ in range(num_layers)]
-                                            task_samples[task] = 0
-
-                                        sample_weights = gate_weights[sample_idx].cpu().tolist()
-                                        for e, w in enumerate(sample_weights):
-                                            task_layer_expert_counts[task][layer_idx][e] += w
-
-                                        if layer_idx == 0:  # Count only once per sample
-                                            task_samples[task] = task_samples.get(task, 0) + 1
-
-        # Normalize
-        if total_samples > 0:
-            for layer_idx in range(num_layers):
-                total = sum(layer_expert_counts[layer_idx])
-                if total > 0:
-                    layer_expert_counts[layer_idx] = [c / total for c in layer_expert_counts[layer_idx]]
-
-        # Normalize per-task
-        task_layer_expert_usage: Dict[str, List[List[float]]] = {}
-        for task, counts in task_layer_expert_counts.items():
-            task_layer_expert_usage[task] = []
-            for layer_idx in range(num_layers):
-                total = sum(counts[layer_idx])
-                if total > 0:
-                    task_layer_expert_usage[task].append([c / total for c in counts[layer_idx]])
-                else:
-                    task_layer_expert_usage[task].append([1.0 / num_experts] * num_experts)
-
-        # Compute entropy per layer
         layer_entropy = []
         for layer_idx in range(num_layers):
-            probs = layer_expert_counts[layer_idx]
-            entropy = 0.0
-            for p in probs:
-                if p > 0:
-                    entropy -= p * math.log(p + 1e-10)
-            layer_entropy.append(entropy)
+            if layer_idx not in per_layer:
+                layer_entropy.append(0.0)
+                continue
+            layer_entropy.append(-sum(p * math.log(p) for p in layer_usage[layer_idx] if p > 0))
 
-        # Compute specialization score per layer (variance across tasks)
+        # Specialization per layer: mean over experts of the across-task variance
         specialization_scores = {}
         for layer_idx in range(num_layers):
-            if len(task_layer_expert_usage) >= 2:
-                # For each expert, compute variance across tasks
-                expert_variances = []
+            score = 0.0
+            if layer_idx in per_layer and len(task_names) >= 2:
+                variances = []
                 for e in range(num_experts):
-                    task_usages = [task_layer_expert_usage[t][layer_idx][e] for t in task_layer_expert_usage]
-                    if len(task_usages) >= 2:
-                        mean_usage = sum(task_usages) / len(task_usages)
-                        variance = sum((u - mean_usage) ** 2 for u in task_usages) / len(task_usages)
-                        expert_variances.append(variance)
+                    vals = [task_usage[t][layer_idx][e] for t in task_names]
+                    mu = sum(vals) / len(vals)
+                    variances.append(sum((v - mu) ** 2 for v in vals) / len(vals))
+                score = sum(variances) / len(variances)
+            specialization_scores[f"layer_{layer_idx}"] = score
 
-                if expert_variances:
-                    specialization_scores[f"layer_{layer_idx}"] = sum(expert_variances) / len(expert_variances)
-                else:
-                    specialization_scores[f"layer_{layer_idx}"] = 0.0
-            else:
-                specialization_scores[f"layer_{layer_idx}"] = 0.0
-
-        self.model.train()
-
-        snapshot = RoutingSnapshot(
+        return RoutingSnapshot(
             step=self.state.global_step,
             epoch=self.state.epoch,
-            layer_expert_usage=layer_expert_counts,
-            task_layer_expert_usage=task_layer_expert_usage,
+            layer_expert_usage=layer_usage,
+            task_layer_expert_usage=task_usage,
             layer_entropy=layer_entropy,
             specialization_scores=specialization_scores,
+            observed_layers=observed,
         )
 
-        return snapshot
+    def _routing_analysis_safely(self) -> None:
+        """Periodic routing analysis: never crashes training, errors stay visible."""
+        if not self.time_allows(self.estimate_routing_analysis_seconds()):
+            logger.warning(f"Routing analysis at step {self.state.global_step} skipped: deadline")
+            return
+        logger.info(f"Running routing analysis at step {self.state.global_step}...")
+        try:
+            snapshot = self.run_routing_analysis()
+        except Exception:
+            self.routing_analysis_failures += 1
+            logger.exception(f"Routing analysis FAILED at step {self.state.global_step} "
+                             f"(failure #{self.routing_analysis_failures}; training continues)")
+            return
+        if snapshot is None:
+            return
+        self.routing_history.append(snapshot)
+        obs = snapshot.observed_layers
+        if not obs:
+            logger.warning("Routing analysis: no gated layer reported gate_weights")
+            return
+        spec = {k: v for k, v in snapshot.specialization_scores.items() if int(k.split("_")[1]) in obs}
+        max_layer, max_score = max(spec.items(), key=lambda x: x[1])
+        mean_entropy = sum(snapshot.layer_entropy[i] for i in obs) / len(obs)
+        logger.info(f"  Max specialization: {max_layer} = {max_score:.4f}, "
+                    f"mean usage entropy = {mean_entropy:.4f}")
+        if WANDB_AVAILABLE and wandb.run is not None:
+            wandb.log({
+                "routing/max_specialization_score": max_score,
+                "routing/max_specialization_layer": int(max_layer.split("_")[1]),
+                "routing/mean_entropy": mean_entropy,
+            }, step=self.state.global_step)
 
-    def _save_routing_history(self):
+    def _save_routing_history(self, directory: Optional[Path] = None):
         """Save routing history to file."""
         if not self.routing_history:
             return
-
-        history_path = self.output_dir / "routing_history.json"
-
-        # Convert to serializable format
-        history_data = []
-        for snapshot in self.routing_history:
-            history_data.append({
-                "step": snapshot.step,
-                "epoch": snapshot.epoch,
-                "layer_expert_usage": snapshot.layer_expert_usage,
-                "task_layer_expert_usage": snapshot.task_layer_expert_usage,
-                "layer_entropy": snapshot.layer_entropy,
-                "specialization_scores": snapshot.specialization_scores,
-            })
-
+        history_path = (directory or self.output_dir) / "routing_history.json"
+        history_data = [asdict(snapshot) for snapshot in self.routing_history]
         with open(history_path, "w") as f:
             json.dump(history_data, f, indent=2)
-
         logger.info(f"Saved {len(history_data)} routing snapshots to {history_path}")
 
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> Tuple[float, Dict[str, float]]:
-        """
-        Execute a single training step.
+    # -------------------------------------------------------------- training
 
-        Returns:
-            Tuple of (loss, metrics_dict)
+    def train_step(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """Forward + backward on one micro-batch.
+
+        Returns detached [loss, lm_loss, load_balancing_loss, entropy_loss] on device
+        (no host sync).
         """
         self.model.train()
+        want_routing = self.is_gated and self.collect_routing_stats and self.log_routing_stats
+        with self._autocast():
+            outputs, logits, tgt, _ = self._forward_selected(batch, answer_only=False,
+                                                             routing_info=want_routing)
+            # Drop every reference to the fp16 [N, V] logits before backward. Gated: plain dict
+            # (routing stats may still be read); baseline: HF ModelOutput (no pop), not needed.
+            if self.is_gated:
+                outputs.pop("logits", None)
+            else:
+                outputs = None
+            # Mean over supervised tokens (= HF causal-LM loss). Every example has >= 1 (EOS).
+            lm_loss = F.cross_entropy(logits.float(), tgt)
+            loss = lm_loss
+            aux: Dict[str, torch.Tensor] = {}
+            if self.is_gated:
+                aux = self.model.aux_losses(lm_loss.device)
+                loss = loss + aux.pop("total")
+        del logits
+        scaled_loss = loss.float() / self.gradient_accumulation_steps
+        self.scaler.scale(scaled_loss).backward()
 
-        # Move batch to device
-        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
-        # Forward pass
-        outputs = self.model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch.get("attention_mask"),
-            labels=batch.get("labels", batch["input_ids"]),
-        )
-
-        # Get loss
-        if isinstance(outputs, dict):
-            loss = outputs.get("loss", outputs.get("lm_loss"))
-        elif hasattr(outputs, "loss"):
-            loss = outputs.loss
-        else:
-            loss = outputs[0]
-
-        # Add load balancing loss if enabled and in joint training phase
-        metrics = {}
-        if self.use_load_balancing and self.state.warmup_completed:
-            if isinstance(outputs, dict) and "load_balancing_loss" in outputs:
-                lb_loss = outputs["load_balancing_loss"]
-                loss = loss + self.load_balancing_weight * lb_loss
-                metrics["load_balancing_loss"] = lb_loss.item() if isinstance(lb_loss, torch.Tensor) else lb_loss
-
-        # Backward pass
-        scaled_loss = loss / self.gradient_accumulation_steps
-        scaled_loss.backward()
-
-        # Extract routing stats
-        if self.log_routing_stats and self.is_gated:
-            if isinstance(outputs, dict):
-                routing_stats = self._extract_routing_stats(outputs)
-                if routing_stats:
-                    self.routing_stats_buffer.append(routing_stats)
-
-        metrics["loss"] = loss.item() if isinstance(loss, torch.Tensor) else loss
-        return loss.item(), metrics
-
-    def eval_step(self, batch: Dict[str, torch.Tensor]) -> Tuple[float, Dict[str, float]]:
-        """Execute a single evaluation step."""
-        self.model.eval()
-
-        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch.get("attention_mask"),
-                labels=batch.get("labels", batch["input_ids"]),
-            )
-
-        if isinstance(outputs, dict):
-            loss = outputs.get("loss", outputs.get("lm_loss"))
-        elif hasattr(outputs, "loss"):
-            loss = outputs.loss
-        else:
-            loss = outputs[0]
-
-        metrics = {"eval_loss": loss.item() if isinstance(loss, torch.Tensor) else loss}
-
-        # Extract routing stats for eval
-        if self.log_routing_stats and self.is_gated and isinstance(outputs, dict):
+        if want_routing:
             routing_stats = self._extract_routing_stats(outputs)
-            for k, v in routing_stats.items():
-                metrics[f"eval_{k}"] = v
+            if routing_stats:
+                self.routing_stats_buffer.append(routing_stats)
 
-        return loss.item(), metrics
+        loss_d = loss.detach().float().reshape(())
+        zero = torch.zeros((), device=loss_d.device)
+        return torch.stack([
+            loss_d,
+            lm_loss.detach().float().reshape(()),
+            aux.get("load_balancing_loss", zero).detach().float().reshape(()),
+            aux.get("l1_gate_loss", zero).detach().float().reshape(()),
+        ])
 
-    def evaluate(self) -> Dict[str, float]:
-        """Run evaluation on the eval dataloader."""
-        if self.eval_dataloader is None:
-            return {}
+    def _optimizer_step(self) -> torch.Tensor:
+        if self.scaler.is_enabled():
+            self.scaler.unscale_(self.optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.trainable_params, self.max_grad_norm)
+        if self.scaler.is_enabled():
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        return grad_norm.detach()
 
+    def _update_reg_scale(self) -> None:
+        if self.gate_reg_warmup_steps > 0:
+            scale = min(1.0, self.state.global_step / self.gate_reg_warmup_steps)
+        else:
+            scale = 1.0
+        self._set_model_attr("reg_scale", float(scale))
+
+    def _log_train(self, loss_sum: torch.Tensor, n_micro: int, grad_norm: Optional[torch.Tensor],
+                   progress_bar: Any) -> None:
+        if n_micro == 0:
+            return
+        packed = torch.cat([loss_sum / n_micro,
+                            (grad_norm if grad_norm is not None else torch.zeros((), device=loss_sum.device))
+                            .float().reshape(1)])
+        loss, lm_loss, lb_loss, ent_loss, gnorm = packed.tolist()  # the only host sync
+        self.state.total_train_loss += loss * n_micro
+        self.state.total_lb_loss += lb_loss * n_micro
+        self.state.num_train_steps += n_micro
+        lr = self.optimizer.param_groups[0]["lr"]
+        remaining = (self.deadline - time.time()) if self.deadline else float("nan")
+        log_dict = {
+            "step": self.state.global_step,
+            "epoch": self.state.epoch,
+            "loss": loss,
+            "lm_loss": lm_loss,
+            "load_balancing_loss": lb_loss,
+            "entropy_reg_loss": ent_loss,
+            "grad_norm": gnorm,
+            "learning_rate": lr,
+            "max_step_seconds": self.max_step_time,
+            "remaining_minutes": remaining / 60,
+            "padding_efficiency": self._tok_real / max(self._tok_total, 1),
+        }
+        self._tok_real = self._tok_total = 0
+        if self.scaler.is_enabled():
+            log_dict["grad_scale"] = self.scaler.get_scale()
+        # fp16: an isolated non-finite step is skipped by the scaler; only a collapsed scale
+        # (>= 16 overflows in a row from 65536) means the run is broken.
+        if (not self.scaler.is_enabled() and not math.isfinite(lm_loss)) \
+                or log_dict.get("grad_scale", 1.0) < 1.0:
+            raise FloatingPointError(
+                f"step {self.state.global_step}: lm_loss={lm_loss}, "
+                f"grad_scale={log_dict.get('grad_scale')} -> the {self.precision} forward overflows "
+                f"(e.g. Gemma-2 / Qwen2.5 in fp16); set model.precision to bf16 (A40) or fp32")
+        if self.is_gated:
+            log_dict["reg_scale"] = float(getattr(self.model, "reg_scale", 1.0))
+        log_dict.update(self._aggregate_routing_stats())
+
+        if TQDM_AVAILABLE and hasattr(progress_bar, "set_postfix"):
+            progress_bar.set_postfix({"loss": f"{loss:.4f}", "lr": f"{lr:.2e}",
+                                      "remain": f"{remaining / 60:.0f}m"})
+        logger.info(
+            f"Step {self.state.global_step}/{self.max_steps} (epoch {self.state.epoch}, "
+            f"sample {self.state.samples_seen}): loss={loss:.4f} lm={lm_loss:.4f} "
+            f"lb={lb_loss:.4f} ent={ent_loss:.4f} gnorm={gnorm:.3f} lr={lr:.2e} "
+            f"pad_eff={log_dict['padding_efficiency']:.2f} "
+            f"step_max={self.max_step_time:.2f}s remaining={remaining / 60:.1f}min"
+        )
+        if WANDB_AVAILABLE and wandb.run is not None:
+            wandb.log(log_dict, step=self.state.global_step)
+
+    # ------------------------------------------------------------ evaluation
+
+    def generation_eval(self, which: str = "final") -> Dict[str, Any]:
+        """Greedy generation on the first `generation_samples_per_task` examples of each task in
+        `generation_tasks` (left-padded, KV cache), scored by training/generation_eval.py.
+        Returns {task: {metric, mean, num_examples, per_example, predictions, example_idx}}."""
+        from gated_lora.training.generation_eval import GEN_MAX_NEW_TOKENS, score
+
+        tok = self.data.tokenizer
+        pad_id, eos_id = self.data.pad_id, tok.eos_token_id
         self.model.eval()
-        total_loss = 0.0
-        num_batches = 0
-        all_metrics = []
+        results: Dict[str, Any] = {}
+        try:
+            for task in self.generation_tasks:
+                t0 = time.time()
+                exs = self.data.generation_examples(task, which, self.generation_samples_per_task)
+                exs = sorted(exs, key=lambda e: len(e["prompt_ids"]))  # less padding
+                max_new = GEN_MAX_NEW_TOKENS.get(task, 64)
+                preds: List[str] = []
+                for i in range(0, len(exs), self.generation_batch_size):
+                    chunk = exs[i:i + self.generation_batch_size]
+                    T = max(len(e["prompt_ids"]) for e in chunk)
+                    ids = torch.full((len(chunk), T), pad_id, dtype=torch.long)
+                    mask = torch.zeros((len(chunk), T), dtype=torch.long)
+                    for r, e in enumerate(chunk):  # LEFT padding for generation
+                        n = len(e["prompt_ids"])
+                        ids[r, T - n:] = e["prompt_ids"]
+                        mask[r, T - n:] = 1
+                    with torch.no_grad(), self._autocast():
+                        out = self.model.generate(
+                            input_ids=self._to_device(ids), attention_mask=self._to_device(mask),
+                            max_new_tokens=max_new, do_sample=False, num_beams=1,
+                            pad_token_id=pad_id, eos_token_id=eos_id, use_cache=True)
+                    for row in out[:, T:].cpu():
+                        preds.append(tok.decode(row, skip_special_tokens=True).strip())
+                refs = [e["reference"] for e in exs]
+                res = score(task, preds, refs)
+                res.update(example_idx=[int(e["example_idx"]) for e in exs], predictions=preds,
+                           seconds=time.time() - t0)
+                results[task] = res
+                logger.info(f"Generation eval {task} ({which}): {res['metric']}={res['mean']:.4f} "
+                            f"on {res['num_examples']} examples ({res['seconds']:.0f}s)")
+        finally:
+            self.model.train()
+        return results
 
-        for batch in self.eval_dataloader:
-            loss, metrics = self.eval_step(batch)
-            total_loss += loss
-            num_batches += 1
-            all_metrics.append(metrics)
+    def _generation_seconds_estimate(self) -> float:
+        # ~0.05 s per generated token step per batch (hooks are Python), x tasks
+        from gated_lora.training.generation_eval import GEN_MAX_NEW_TOKENS
+        n_batches = math.ceil(self.generation_samples_per_task / self.generation_batch_size)
+        return sum(n_batches * GEN_MAX_NEW_TOKENS.get(t, 64) * 0.05 + 60
+                   for t in self.generation_tasks)
 
-        avg_loss = total_loss / max(num_batches, 1)
+    def _accumulate_top1(self, outputs: Any, batch: Dict[str, Any],
+                         acc: Dict[int, List[torch.Tensor]]) -> None:
+        """Token-level top-1 gate weight per layer (same statistic as the frozen-gate
+        calibration), summed on device."""
+        pli = (_out(outputs, "routing_info") or {}).get("per_layer_info", {})
+        am = self._to_device(batch["attention_mask"]).float()
+        n = am.sum()
+        for layer_key, info in pli.items():
+            gw = info.get("gate_weights")
+            if info.get("uniform") or gw is None or gw.dim() != 3:
+                continue
+            top1 = (gw.float().max(dim=-1).values * am).sum()
+            a = acc.setdefault(int(layer_key), [torch.zeros((), device=am.device),
+                                                torch.zeros((), device=am.device)])
+            a[0] += top1
+            a[1] += n
 
-        # Aggregate metrics
-        result = {"eval_loss": avg_loss}
-        if all_metrics:
-            for key in all_metrics[0].keys():
-                if key != "eval_loss":
-                    values = [m[key] for m in all_metrics if key in m]
-                    if values:
-                        result[key] = sum(values) / len(values)
+    def _row_gate_means(self, outputs: Any, batch: Dict[str, Any]):
+        """Per row: mean gate weights per layer over prompt tokens and over answer tokens
+        ([B, L, E] each, NaN for layers without learned routing)."""
+        pli = (_out(outputs, "routing_info") or {}).get("per_layer_info", {})
+        am = self._to_device(batch["attention_mask"]).float()
+        ans = self._to_device(batch["answer_mask"]).float() * am
+        prm = am - ans
+        L, E = self.model.num_layers, self.model.num_experts
+        B = am.size(0)
+        gp = torch.full((B, L, E), float("nan"), device=am.device)
+        ga = torch.full((B, L, E), float("nan"), device=am.device)
+        for layer_key, info in pli.items():
+            gw = info.get("gate_weights")
+            if info.get("uniform") or gw is None or gw.dim() != 3:
+                continue
+            gw = gw.float()
+            l = int(layer_key)
+            gp[:, l] = (gw * prm.unsqueeze(-1)).sum(1) / prm.sum(1, keepdim=True).clamp(min=1)
+            ga[:, l] = (gw * ans.unsqueeze(-1)).sum(1) / ans.sum(1, keepdim=True).clamp(min=1)
+        return gp.half(), ga.half()
 
-        # Compute perplexity
-        result["eval_perplexity"] = math.exp(min(avg_loss, 20))  # Cap to avoid overflow
+    def _write_example_dump(self, path: Path, row_tasks: List[str], S: List[List[float]],
+                            ex_meta: List[Tuple[torch.Tensor, torch.Tensor]],
+                            ex_gates: List[Tuple[torch.Tensor, torch.Tensor]],
+                            top1_acc: Optional[Dict[int, List[torch.Tensor]]] = None) -> None:
+        """npz, one entry per example: task, example_idx (index in the task's tokenised final
+        subset), prompt_len, answer_nll_sum, answer_tokens, answer_correct (EM = correct ==
+        tokens), and gate_prompt / gate_answer [N, L, E] float16 (gated models) +
+        layer_top1_dominance [L] (token-level mean of the max gate weight over all real tokens,
+        NaN for layers without learned routing: the frozen-gate calibration target)."""
+        arrays: Dict[str, Any] = {
+            "task": np.array(row_tasks),
+            "example_idx": torch.cat([m[0] for m in ex_meta]).numpy(),
+            "prompt_len": torch.cat([m[1] for m in ex_meta]).numpy(),
+            "answer_nll_sum": np.array([r[0] for r in S], dtype=np.float32),
+            "answer_tokens": np.array([r[1] for r in S], dtype=np.int32),
+            "answer_correct": np.array([r[2] for r in S], dtype=np.int32),
+        }
+        if top1_acc:
+            top1 = np.full(self.model.num_layers, np.nan, dtype=np.float32)
+            for l, (num, den) in top1_acc.items():
+                top1[l] = float(num) / max(float(den), 1.0)
+            arrays["layer_top1_dominance"] = top1
+        if ex_gates:
+            arrays["gate_prompt"] = torch.cat([g[0] for g in ex_gates]).cpu().numpy()
+            arrays["gate_answer"] = torch.cat([g[1] for g in ex_gates]).cpu().numpy()
+        tmp = path.with_name(path.name + ".tmp.npz")
+        np.savez_compressed(tmp, **arrays)
+        os.replace(tmp, path)
+        logger.info(f"Per-example dump: {len(row_tasks)} examples -> {path}")
 
+    def evaluate(self, which: str = "val", samples_per_task: Optional[int] = None,
+                 dump_path: Optional[Path] = None) -> Dict[str, Any]:
+        """Answer-level evaluation (autocast + no_grad).
+
+        Per task and overall: answer loss (mean NLL over answer tokens, i.e.
+        labels != -100 and answer_mask), answer token accuracy, and
+        teacher-forced exact match (every answer token incl. EOS argmax-correct).
+        `eval_loss` = mean over tasks of the per-task answer loss.
+
+        ``dump_path``: also write per-example arrays (npz, see `_write_example_dump`): task,
+        example_idx, prompt_len, answer NLL sum / token count / correct count and, for gated
+        models, the per-layer mean gate weights over PROMPT tokens and over ANSWER tokens.
+        """
+        loader = self._eval_loader(which, samples_per_task)
+        prev_collect = getattr(self.model, "collect_routing_stats", None)
+        self._set_model_attr("collect_routing_stats", False)
+        self.model.eval()
+        t0 = time.time()
+        rows: List[torch.Tensor] = []  # [B, 3]: nll_sum, n_tok, n_correct
+        row_tasks: List[str] = []
+        ex_meta: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        ex_gates: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        top1_acc: Dict[int, List[torch.Tensor]] = {}  # layer -> [sum(top1 * tokens), tokens]
+        n_batches = 0
+        try:
+            with torch.no_grad(), self._autocast():
+                for batch in loader:
+                    want_gates = dump_path is not None and self.is_gated
+                    outputs, sel, tgt, row_idx = self._forward_selected(
+                        batch, answer_only=True, routing_info=want_gates)
+                    if dump_path is not None:
+                        ex_meta.append((batch["example_idx"], batch["prompt_len"]))
+                        if want_gates:
+                            ex_gates.append(self._row_gate_means(outputs, batch))
+                            self._accumulate_top1(outputs, batch, top1_acc)
+                    del outputs  # sel: [N, V] answer positions only
+                    # Row chunks: an fp32 [N, V] copy (+ log-softmax) is ~30 GB for a
+                    # 152k vocab at N ~ 14k answer tokens.
+                    nll = torch.empty(tgt.shape[0], device=tgt.device, dtype=torch.float32)
+                    correct = torch.empty_like(nll)
+                    for s in range(0, tgt.shape[0], _EVAL_CE_CHUNK):
+                        c = sel[s:s + _EVAL_CE_CHUNK].float()
+                        t = tgt[s:s + _EVAL_CE_CHUNK]
+                        nll[s:s + _EVAL_CE_CHUNK] = F.cross_entropy(c, t, reduction="none")
+                        correct[s:s + _EVAL_CE_CHUNK] = (c.argmax(dim=-1) == t).float()
+                    del sel
+                    bsz = batch["labels"].size(0)
+                    z = torch.zeros(bsz, device=tgt.device)
+                    rows.append(torch.stack([
+                        z.index_add(0, row_idx, nll),
+                        z.index_add(0, row_idx, torch.ones_like(nll)),
+                        z.index_add(0, row_idx, correct),
+                    ], dim=1))
+                    row_tasks.extend(batch["task"])
+                    n_batches += 1
+        finally:
+            self.model.train()
+            if prev_collect is not None:
+                self._set_model_attr("collect_routing_stats", prev_collect)
+
+        elapsed = time.time() - t0
+        if n_batches:
+            per_batch = elapsed / n_batches
+            self._eval_sec_per_batch = max(self._eval_sec_per_batch or 0.0, per_batch)
+        if not rows:
+            return {"which": which, "num_examples": 0, "eval_seconds": elapsed}
+
+        S = torch.cat(rows).cpu().tolist()  # single host sync
+        if dump_path is not None:
+            self._write_example_dump(dump_path, row_tasks, S, ex_meta, ex_gates, top1_acc)
+        acc: Dict[str, List[float]] = {}
+        for task, (nll_sum, ntok, ncorr) in zip(row_tasks, S):
+            a = acc.setdefault(task, [0.0, 0.0, 0.0, 0, 0])
+            a[0] += nll_sum
+            a[1] += ntok
+            a[2] += ncorr
+            if ntok > 0:
+                a[3] += 1
+                a[4] += int(ncorr == ntok)
+
+        per_task: Dict[str, Dict[str, float]] = {}
+        for task, (nll_sum, ntok, ncorr, n_ex, n_em) in sorted(acc.items()):
+            per_task[task] = {
+                "answer_loss": nll_sum / ntok if ntok else float("nan"),
+                "answer_token_acc": ncorr / ntok if ntok else float("nan"),
+                "exact_match": n_em / n_ex if n_ex else float("nan"),
+                "num_examples": n_ex,
+                "num_answer_tokens": int(ntok),
+            }
+        tot = [sum(a[i] for a in acc.values()) for i in range(5)]
+        valid = [m for m in per_task.values() if m["num_answer_tokens"] > 0]
+        mean_task_loss = sum(m["answer_loss"] for m in valid) / len(valid) if valid else float("nan")
+        result = {
+            "which": which,
+            "step": self.state.global_step,
+            "samples_per_task": samples_per_task,
+            "eval_loss": mean_task_loss,
+            "mean_task_answer_loss": mean_task_loss,
+            "mean_task_exact_match": (sum(m["exact_match"] for m in valid) / len(valid)) if valid else float("nan"),
+            "answer_loss": tot[0] / tot[1] if tot[1] else float("nan"),
+            "answer_token_acc": tot[2] / tot[1] if tot[1] else float("nan"),
+            "exact_match": tot[4] / tot[3] if tot[3] else float("nan"),
+            "num_examples": int(tot[3]),
+            "eval_seconds": elapsed,
+            "per_task": per_task,
+        }
         return result
 
-    def find_latest_checkpoint(self) -> Optional[Path]:
-        """Find the latest checkpoint in output_dir."""
-        if not self.output_dir.exists():
-            return None
-
-        # Look for checkpoint-* directories
-        checkpoint_dirs = []
-        for d in self.output_dir.iterdir():
-            if d.is_dir() and d.name.startswith("checkpoint-"):
-                # Extract step number
-                match = re.match(r"checkpoint-(\d+)", d.name)
-                if match:
-                    step = int(match.group(1))
-                    checkpoint_dirs.append((step, d))
-
-        # Also check for "latest" checkpoint (saved on timeout)
-        latest_dir = self.output_dir / "latest"
-        if latest_dir.exists() and (latest_dir / "training_state.json").exists():
-            # Read step from training_state.json
-            with open(latest_dir / "training_state.json", "r") as f:
-                state = json.load(f)
-                step = state.get("global_step", 0)
-                checkpoint_dirs.append((step, latest_dir))
-
-        if not checkpoint_dirs:
-            return None
-
-        # Return the one with highest step
-        checkpoint_dirs.sort(key=lambda x: x[0], reverse=True)
-        return checkpoint_dirs[0][1]
-
-    def train(self, resume_from_checkpoint: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Main training loop with 2-phase training.
-
-        Phase 1 (Warmup): Train only gating network
-        Phase 2 (Joint): Train both gating and experts
-
-        Args:
-            resume_from_checkpoint: Path to checkpoint to resume from, or "auto" to find latest
-        """
-        logger.info("=" * 60)
-        logger.info("Starting Gated LoRA Training")
-        logger.info("=" * 60)
-
-        # Handle resume
-        start_epoch = 0
-        start_batch_idx = 0
-
-        if resume_from_checkpoint:
-            if resume_from_checkpoint == "auto":
-                checkpoint_path = self.find_latest_checkpoint()
-                if checkpoint_path:
-                    logger.info(f"Auto-detected checkpoint: {checkpoint_path}")
-                else:
-                    logger.info("No checkpoint found, starting from scratch")
-            else:
-                checkpoint_path = Path(resume_from_checkpoint)
-
-            if checkpoint_path and checkpoint_path.exists():
-                self.load_checkpoint(str(checkpoint_path))
-                start_epoch = self.state.epoch
-                start_batch_idx = self.state.batch_idx
-                logger.info(f"Resuming from epoch {start_epoch + 1}, batch {start_batch_idx}")
-                logger.info(f"  Global step: {self.state.global_step}")
-                logger.info(f"  Warmup completed: {self.state.warmup_completed}")
-
-        # Check if training is already complete
-        if start_epoch >= self.num_epochs:
-            logger.info("Training already complete!")
-            self._mark_training_done()
-            return {
-                "status": "already_complete",
-                "final_train_loss": self.state.total_train_loss / max(self.state.num_train_steps, 1),
-                "best_eval_loss": self.state.best_eval_loss,
-                "total_steps": self.state.global_step,
-            }
-
-        # Phase 1: Gating Warmup (if enabled and not already completed)
-        warmup_enabled = (self.gating_warmup_epochs > 0 or self.gating_warmup_steps > 0) and self.freeze_experts_during_warmup and self.is_gated
-        if warmup_enabled and not self.state.warmup_completed:
-            if self.gating_warmup_epochs > 0:
-                logger.info(f"\n--- Phase 1: Gating Warmup ({self.gating_warmup_epochs} epoch(s)) ---")
-            else:
-                logger.info(f"\n--- Phase 1: Gating Warmup ({self.gating_warmup_steps} steps) ---")
-            self._freeze_experts()
-
-        total_batches_per_epoch = len(self.train_dataloader)
-        total_steps = total_batches_per_epoch * self.num_epochs
-        logger.info(f"Total batches per epoch: {total_batches_per_epoch}")
-        logger.info(f"Total training batches: {total_steps}")
-        logger.info(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
-
-        # Log initial VRAM usage
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-            allocated = torch.cuda.memory_allocated() / 1e9
-            reserved = torch.cuda.memory_reserved() / 1e9
-            logger.info(f"Initial VRAM - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
-
-        start_time = time.time()
-        self.optimizer.zero_grad()
-
-        # Track if we hit the time limit
-        hit_time_limit = False
-
-        for epoch in range(start_epoch, self.num_epochs):
-            self.state.epoch = epoch
-            epoch_loss = 0.0
-            epoch_steps = 0
-
-            logger.info(f"\n=== Epoch {epoch + 1}/{self.num_epochs} ===")
-
-            # Determine starting batch for this epoch
-            skip_batches = start_batch_idx if epoch == start_epoch else 0
-            if skip_batches > 0:
-                logger.info(f"Skipping first {skip_batches} batches (already processed)")
-
-            # Create progress bar for this epoch
-            if TQDM_AVAILABLE:
-                progress_bar = tqdm(
-                    enumerate(self.train_dataloader),
-                    total=total_batches_per_epoch,
-                    desc=f"Epoch {epoch + 1}/{self.num_epochs}",
-                    unit="batch",
-                    dynamic_ncols=True,
-                    leave=True,
-                    initial=skip_batches,  # Start progress bar at correct position
-                )
-            else:
-                progress_bar = enumerate(self.train_dataloader)
-
-            # Check for epoch-based warmup completion at start of epoch
-            if (not self.state.warmup_completed and
-                self.gating_warmup_epochs > 0 and
-                epoch >= self.gating_warmup_epochs and
-                self.is_gated):
-
-                logger.info(f"\n--- Phase 2: Joint Training (after {self.gating_warmup_epochs} warmup epoch(s)) ---")
-                self._unfreeze_experts()
-                self.state.warmup_completed = True
-
-            for batch_idx, batch in progress_bar:
-                # Skip batches if resuming mid-epoch
-                if batch_idx < skip_batches:
-                    continue
-
-                # Update batch_idx in state for checkpointing
-                self.state.batch_idx = batch_idx
-
-                # Check for step-based warmup completion (only if not using epoch-based)
-                if (not self.state.warmup_completed and
-                    self.gating_warmup_epochs == 0 and
-                    self.state.global_step >= self.gating_warmup_steps and
-                    self.gating_warmup_steps > 0 and
-                    self.is_gated):
-
-                    logger.info(f"\n--- Phase 2: Joint Training (step {self.state.global_step}) ---")
-                    self._unfreeze_experts()
-                    self.state.warmup_completed = True
-
-                # Training step
-                loss, metrics = self.train_step(batch)
-                epoch_loss += loss
-                epoch_steps += 1
-                self.state.total_train_loss += loss
-                self.state.num_train_steps += 1
-
-                # Log VRAM after first batch
-                if batch_idx == skip_batches and epoch == start_epoch and torch.cuda.is_available():
-                    peak_vram = torch.cuda.max_memory_allocated() / 1e9
-                    logger.info(f"Peak VRAM after first batch: {peak_vram:.2f}GB / 47GB")
-
-                # Gradient accumulation
-                if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
-                    self.optimizer.step()
-                    if self.scheduler is not None:
-                        self.scheduler.step()
-                    self.optimizer.zero_grad()
-
-                    self.state.global_step += 1
-
-                    # Logging
-                    if self.state.global_step % self.logging_steps == 0:
-                        avg_loss = epoch_loss / epoch_steps
-                        lr = self.optimizer.param_groups[0]["lr"]
-                        phase = "warmup" if not self.state.warmup_completed else "joint"
-                        elapsed = time.time() - start_time
-                        remaining = self.max_runtime_seconds - elapsed
-
-                        log_dict = {
-                            "step": self.state.global_step,
-                            "epoch": epoch + 1,
-                            "batch_idx": batch_idx,
-                            "loss": avg_loss,
-                            "learning_rate": lr,
-                            "phase": phase,
-                            "elapsed_minutes": elapsed / 60,
-                            "remaining_minutes": remaining / 60,
-                        }
-
-                        # Add routing stats
-                        if self.routing_stats_buffer:
-                            routing_stats = self._aggregate_routing_stats()
-                            log_dict.update(routing_stats)
-
-                        # Update tqdm progress bar with metrics
-                        if TQDM_AVAILABLE and hasattr(progress_bar, 'set_postfix'):
-                            progress_bar.set_postfix({
-                                'loss': f'{avg_loss:.4f}',
-                                'lr': f'{lr:.2e}',
-                                'remain': f'{remaining/60:.0f}m',
-                            })
-
-                        logger.info(
-                            f"Step {self.state.global_step} (batch {batch_idx}): loss={avg_loss:.4f}, "
-                            f"lr={lr:.2e}, phase={phase}, remaining={remaining/60:.1f}min"
-                        )
-
-                        # WandB logging
-                        if WANDB_AVAILABLE and wandb.run is not None:
-                            wandb.log(log_dict, step=self.state.global_step)
-
-                    # Evaluation — skipped when close to the runtime budget:
-                    # a full eval can take 15-30 min, and overshooting the
-                    # SLURM wall means SIGKILL with no "latest" checkpoint.
-                    eval_time_ok = (
-                        time.time() - start_time
-                    ) < self.max_runtime_seconds - 20 * 60
-                    if (self.state.global_step % self.eval_steps == 0
-                            and self.eval_dataloader is not None
-                            and eval_time_ok):
-                        eval_metrics = self.evaluate()
-                        logger.info(f"Eval at step {self.state.global_step}: {eval_metrics}")
-
-                        if WANDB_AVAILABLE and wandb.run is not None:
-                            wandb.log(eval_metrics, step=self.state.global_step)
-
-                        # Track best model
-                        if eval_metrics["eval_loss"] < self.state.best_eval_loss:
-                            self.state.best_eval_loss = eval_metrics["eval_loss"]
-                            self.save_checkpoint("best_model")
-
-                    # Checkpoint saving
-                    if self.state.global_step % self.save_steps == 0:
-                        self.save_checkpoint(f"checkpoint-{self.state.global_step}")
-
-                    # Periodic routing analysis for convergence study
-                    if (self.state.global_step % self.routing_analysis_steps == 0 and
-                        self.is_gated and self.analysis_dataloader is not None):
-                        logger.info(f"Running routing analysis at step {self.state.global_step}...")
-                        snapshot = self.run_routing_analysis(num_batches=20)
-                        if snapshot is not None:
-                            self.routing_history.append(snapshot)
-                            max_spec_layer = max(snapshot.specialization_scores.items(), key=lambda x: x[1])
-                            logger.info(f"  Max specialization: {max_spec_layer[0]} = {max_spec_layer[1]:.4f}")
-                            if WANDB_AVAILABLE and wandb.run is not None:
-                                wandb.log({
-                                    "routing/max_specialization_score": max_spec_layer[1],
-                                    "routing/max_specialization_layer": int(max_spec_layer[0].split("_")[1]),
-                                    "routing/mean_entropy": sum(snapshot.layer_entropy) / len(snapshot.layer_entropy),
-                                }, step=self.state.global_step)
-
-                # Check time limit - save and exit if approaching limit
-                elapsed = time.time() - start_time
-                if elapsed >= self.max_runtime_seconds:
-                    logger.info(f"\n{'='*60}")
-                    logger.info(f"TIME LIMIT REACHED ({elapsed/3600:.2f} hours)")
-                    logger.info(f"Saving checkpoint and exiting...")
-                    logger.info(f"{'='*60}")
-
-                    # Save checkpoint with next batch position
-                    self.state.batch_idx = batch_idx + 1
-                    if self.state.batch_idx >= total_batches_per_epoch:
-                        # Move to next epoch
-                        self.state.epoch = epoch + 1
-                        self.state.batch_idx = 0
-
-                    self.save_checkpoint("latest")
-                    hit_time_limit = True
-                    break
-
-            if hit_time_limit:
-                break
-
-            # End of epoch - reset batch_idx for next epoch
-            self.state.batch_idx = 0
-
-            # End of epoch evaluation (same runtime guard as step-based eval)
-            eval_time_ok = (time.time() - start_time) < self.max_runtime_seconds - 20 * 60
-            eval_metrics = self.evaluate() if (self.eval_dataloader and eval_time_ok) else {}
-            epoch_avg_loss = epoch_loss / max(epoch_steps, 1)
-
-            logger.info(f"Epoch {epoch + 1} completed: avg_loss={epoch_avg_loss:.4f}")
-            if eval_metrics:
-                logger.info(f"Eval metrics: {eval_metrics}")
-
-            # Save end-of-epoch checkpoint
-            self.save_checkpoint(f"epoch-{epoch + 1}")
-
-        # Training complete or time limit hit
-        elapsed_time = time.time() - start_time
-
-        if hit_time_limit:
-            logger.info(f"\nJob ended due to time limit after {elapsed_time / 60:.2f} minutes")
-            logger.info(f"Resume with --resume auto to continue training")
-            return {
-                "status": "time_limit",
-                "current_epoch": self.state.epoch,
-                "current_batch": self.state.batch_idx,
-                "global_step": self.state.global_step,
-                "training_time_minutes": elapsed_time / 60,
-            }
-
-        logger.info(f"\nTraining completed in {elapsed_time / 60:.2f} minutes")
-
-        # Final evaluation
-        final_metrics = self.evaluate() if self.eval_dataloader else {}
-
-        # Save final model
-        self.save_checkpoint("final_model")
-
-        # Save routing history for convergence analysis
-        if self.routing_history:
-            self._save_routing_history()
-            logger.info(f"Saved {len(self.routing_history)} routing snapshots")
-
-        # Mark training as done
-        self._mark_training_done()
-
-        # Final push so TRAINING_DONE (and any straggler files) land on HF Hub
-        # before this SLURM job exits — login-side chain_jobs.sh polls HF to
-        # decide whether to resubmit, so the marker MUST be there.
-        try:
-            import sys
-            from pathlib import Path as _P
-            scripts_dir = _P(__file__).resolve().parents[3] / "scripts" / "transfer"
-            if str(scripts_dir) not in sys.path:
-                sys.path.insert(0, str(scripts_dir))
-            from ensimag_push import push_single_run
-            push_single_run(_P(self.output_dir))
-        except Exception as exc:
-            logger.warning(f"final push skipped ({type(exc).__name__}): {exc}")
-
-        return {
-            "status": "completed",
-            "final_train_loss": self.state.total_train_loss / max(self.state.num_train_steps, 1),
-            "final_eval_metrics": final_metrics,
-            "best_eval_loss": self.state.best_eval_loss,
-            "total_steps": self.state.global_step,
-            "training_time_minutes": elapsed_time / 60,
-            "num_routing_snapshots": len(self.routing_history),
-        }
-
-    def _mark_training_done(self):
-        """Create a marker file indicating training is complete."""
-        done_file = self.output_dir / "TRAINING_DONE"
-        with open(done_file, "w") as f:
-            f.write(f"Training completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Total epochs: {self.num_epochs}\n")
-            f.write(f"Total steps: {self.state.global_step}\n")
-            f.write(f"Best eval loss: {self.state.best_eval_loss}\n")
-        logger.info(f"Created {done_file}")
-
-    def is_training_done(self) -> bool:
-        """Check if training is already complete."""
-        done_file = self.output_dir / "TRAINING_DONE"
-        return done_file.exists()
-
-    def save_checkpoint(self, name: str):
-        """Save model checkpoint, then push older checkpoints to HF Hub.
-
-        Push policy (best-effort, never crashes training):
-        - The just-saved checkpoint stays local — it may be needed for resume.
-        - All older `checkpoint-N/` (and `best_model`/`final_model`) are pushed
-          to `Helain/gated-lora-experiments/<run>/<ckpt>/` and deleted locally.
-        - On `TRAINING_DONE`, root files (`final_results.json`, `routing_history.json`,
-          figures) are pushed and the run dir is reduced to the marker.
-
-        Re-authentication on every call: compute nodes lose HF auth state
-        between SLURM jobs, so the push helper logs in fresh from HF_TOKEN.
-        """
-        checkpoint_dir = self.output_dir / name
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save model state
+    def _log_eval(self, metrics: Dict[str, Any], tag: str) -> None:
+        logger.info(
+            f"[{tag}] step {self.state.global_step}: mean_task_answer_loss="
+            f"{metrics.get('mean_task_answer_loss', float('nan')):.4f} "
+            f"answer_loss={metrics.get('answer_loss', float('nan')):.4f} "
+            f"tok_acc={metrics.get('answer_token_acc', float('nan')):.4f} "
+            f"EM={metrics.get('exact_match', float('nan')):.4f} "
+            f"({metrics.get('num_examples', 0)} ex, {metrics.get('eval_seconds', 0):.0f}s)"
+        )
+        for task, m in metrics.get("per_task", {}).items():
+            logger.info(f"    {task:>14}: loss={m['answer_loss']:.4f} acc={m['answer_token_acc']:.4f} "
+                        f"EM={m['exact_match']:.4f} (n={m['num_examples']})")
+        if WANDB_AVAILABLE and wandb.run is not None:
+            flat = {f"{tag}/{k}": v for k, v in metrics.items() if isinstance(v, (int, float))}
+            for task, m in metrics.get("per_task", {}).items():
+                flat.update({f"{tag}/{task}/{k}": v for k, v in m.items()})
+            wandb.log(flat, step=self.state.global_step)
+
+    def _maybe_eval_for_selection(self) -> None:
+        """Subset "val" eval for best-model selection (at most once per step)."""
+        if self.state.last_eval_step == self.state.global_step:
+            return
+        loader = self._eval_loader("val", self.eval_samples_per_task)
+        if not self.time_allows(self._eval_seconds_estimate(loader)):
+            logger.warning(f"Eval at step {self.state.global_step} skipped: deadline too close")
+            return
+        metrics = self.evaluate("val", self.eval_samples_per_task)
+        self.state.last_eval_step = self.state.global_step
+        self._log_eval(metrics, "eval")
+        loss = metrics.get("eval_loss", float("nan"))
+        if loss == loss and loss < self.state.best_eval_loss:  # NaN-safe
+            logger.info(f"  New best val mean task answer loss {loss:.4f} "
+                        f"(prev {self.state.best_eval_loss:.4f})")
+            self.state.best_eval_loss = loss
+            self.state.best_eval_step = self.state.global_step
+            self._save_weights_dir("best_model")
+            self._best_dirty = True
+
+    # ----------------------------------------------------------- checkpoints
+
+    def _atomic_dir_save(self, name: str, writer: Callable[[Path], None]) -> Path:
+        """Write <name>.tmp/ then swap it in place (old copy kept as <name>.old/ until done)."""
+        final = self.output_dir / name
+        tmp = self.output_dir / f"{name}.tmp"
+        old = self.output_dir / f"{name}.old"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+        writer(tmp)
+        if final.exists():
+            if old.exists():
+                shutil.rmtree(old)
+            os.replace(final, old)
+        os.replace(tmp, final)
+        if old.exists():
+            shutil.rmtree(old, ignore_errors=True)
+        return final
+
+    def _write_weights(self, directory: Path) -> None:
         if hasattr(self.model, "save_pretrained"):
-            self.model.save_pretrained(checkpoint_dir)
+            self.model.save_pretrained(str(directory))
         else:
-            torch.save(self.model.state_dict(), checkpoint_dir / "model.pt")
+            trainable = {n: p.detach().cpu() for n, p in self.model.named_parameters() if p.requires_grad}
+            torch.save(trainable, directory / "model.pt")
 
-        # Save optimizer state
-        torch.save(self.optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
+    def _save_weights_dir(self, name: str) -> None:
+        self._atomic_dir_save(name, self._write_weights)
+        logger.info(f"Saved {name}/ (weights only)")
 
-        # Save scheduler state
-        if self.scheduler is not None:
-            torch.save(self.scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
+    def _training_state_dict(self) -> Dict[str, Any]:
+        st = asdict(self.state)
+        st.update({
+            "max_steps": self.max_steps,
+            "seed": self.seed,
+            "precision": self.precision,
+            "max_step_time": self.max_step_time,
+            "routing_analysis_failures": self.routing_analysis_failures,
+            "rng": _rng_state(),
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        return st
 
-        # Save training state (including batch_idx for resume)
-        state_dict = {
-            "global_step": self.state.global_step,
-            "epoch": self.state.epoch,
-            "batch_idx": self.state.batch_idx,
-            "best_eval_loss": self.state.best_eval_loss,
-            "warmup_completed": self.state.warmup_completed,
-            "total_train_loss": self.state.total_train_loss,
-            "num_train_steps": self.state.num_train_steps,
-        }
-        with open(checkpoint_dir / "training_state.json", "w") as f:
-            json.dump(state_dict, f, indent=2)
+    def save_checkpoint(self, name: str = "latest"):
+        """Save the resumable `latest/` checkpoint (atomic, local only).
 
-        logger.info(f"Saved checkpoint to {checkpoint_dir}")
+        Contents: adapter weights + optimizer.pt + scheduler.pt + scaler.pt +
+        training_state.json (global_step, epoch, samples_seen, RNG states) +
+        routing_history.json. Only valid at an optimizer-step boundary.
+        """
+        if name != "latest":
+            raise ValueError("Only latest/ carries optimizer state in v2; use _save_weights_dir")
 
-        # Best-effort post-save push (older checkpoints → HF Hub, then delete).
-        # Skipped silently if HF_TOKEN missing or push module unavailable.
-        try:
-            import sys
-            from pathlib import Path as _P
-            scripts_dir = _P(__file__).resolve().parents[3] / "scripts" / "transfer"
-            if str(scripts_dir) not in sys.path:
-                sys.path.insert(0, str(scripts_dir))
-            from ensimag_push import push_single_run
-            push_single_run(_P(self.output_dir))
-        except Exception as exc:
-            logger.warning(f"post-save push skipped ({type(exc).__name__}): {exc}")
+        def _writer(d: Path) -> None:
+            self._write_weights(d)
+            torch.save(self.optimizer.state_dict(), d / "optimizer.pt")
+            if self.scheduler is not None:
+                torch.save(self.scheduler.state_dict(), d / "scheduler.pt")
+            if self.scaler.is_enabled():
+                torch.save(self.scaler.state_dict(), d / "scaler.pt")
+            with open(d / "training_state.json", "w") as f:
+                json.dump(self._training_state_dict(), f)
+            self._save_routing_history(d)
+
+        self._atomic_dir_save("latest", _writer)
+        logger.info(f"Saved latest/ at step {self.state.global_step} "
+                    f"(epoch {self.state.epoch}, samples_seen {self.state.samples_seen})")
+
+    def find_latest_checkpoint(self) -> Optional[Path]:
+        """latest/ (or latest.old/ if a crash happened mid-swap) with a training_state.json."""
+        for name in ("latest", "latest.old"):
+            d = self.output_dir / name
+            if (d / "training_state.json").exists():
+                return d
+        return None
 
     def load_checkpoint(self, path: str):
-        """Load model checkpoint.
-
-        NOTE (2026-07 fix): the historical implementation restored optimizer/
-        scheduler/training-state but silently SKIPPED the model weights for
-        any model saved via ``save_pretrained`` (GatedLoRAModelV2 and PEFT
-        baselines both are). Cross-job SLURM resume therefore restarted the
-        adapters from scratch while reusing a stale optimizer state. This now
-        loads the weights explicitly for both model families and refuses to
-        resume when it cannot.
-        """
+        """Load a checkpoint: weights (both model families), optimizer, scheduler,
+        scaler, training state and RNG. Refuses to resume without weights."""
         checkpoint_dir = Path(path)
 
         # Load model state
@@ -995,7 +1240,7 @@ class GatedLoRATrainer:
             state_dict = torch.load(
                 checkpoint_dir / "model.pt", map_location=self.device, weights_only=True
             )
-            self.model.load_state_dict(state_dict)
+            self.model.load_state_dict(state_dict, strict=False)
             logger.info(f"Loaded model from {checkpoint_dir / 'model.pt'}")
         elif hasattr(self.model, "load_adapter_state"):
             # GatedLoRAModelV2: restore experts + gating in place
@@ -1025,36 +1270,376 @@ class GatedLoRATrainer:
                 f"(looked for model.pt / expert_pools.pt+gating_network.pt / adapter_model.*). "
                 f"Resuming without weights would silently restart training."
             )
+        bad = [p.dtype for p in self.trainable_params if p.dtype != torch.float32]
+        if bad:
+            raise RuntimeError(f"Trainable params lost fp32 after loading weights: {set(bad)}")
 
-        # Load optimizer state
         if (checkpoint_dir / "optimizer.pt").exists():
             self.optimizer.load_state_dict(
                 torch.load(checkpoint_dir / "optimizer.pt", map_location=self.device)
             )
-            logger.info(f"Loaded optimizer state")
+            logger.info("Loaded optimizer state")
+        else:
+            logger.warning("No optimizer.pt in checkpoint: optimizer restarts from scratch")
 
-        # Load scheduler state
         if self.scheduler is not None and (checkpoint_dir / "scheduler.pt").exists():
             self.scheduler.load_state_dict(
                 torch.load(checkpoint_dir / "scheduler.pt", map_location=self.device)
             )
-            logger.info(f"Loaded scheduler state")
+            logger.info("Loaded scheduler state")
 
-        # Load training state
+        if self.scaler.is_enabled() and (checkpoint_dir / "scaler.pt").exists():
+            self.scaler.load_state_dict(torch.load(checkpoint_dir / "scaler.pt"))
+            logger.info("Loaded grad scaler state")
+
         if (checkpoint_dir / "training_state.json").exists():
             with open(checkpoint_dir / "training_state.json", "r") as f:
-                state_dict = json.load(f)
-                self.state.global_step = state_dict.get("global_step", 0)
-                self.state.epoch = state_dict.get("epoch", 0)
-                self.state.batch_idx = state_dict.get("batch_idx", 0)  # NEW
-                self.state.best_eval_loss = state_dict.get("best_eval_loss", float("inf"))
-                self.state.warmup_completed = state_dict.get("warmup_completed", False)
-                self.state.total_train_loss = state_dict.get("total_train_loss", 0.0)  # NEW
-                self.state.num_train_steps = state_dict.get("num_train_steps", 0)  # NEW
+                st = json.load(f)
+            for key in TrainingState.__dataclass_fields__:
+                if key in st:
+                    setattr(self.state, key, type(getattr(TrainingState(), key))(st[key]))
+            if "samples_seen" not in st:
+                # Legacy checkpoint: batch_idx was the next batch to process.
+                self.state.samples_seen = int(st.get("batch_idx", 0)) * self.batch_size
+                logger.warning(f"Legacy training_state.json (no samples_seen): resuming at "
+                               f"sample {self.state.samples_seen} of epoch {self.state.epoch}")
+            if st.get("precision") not in (None, self.precision):
+                logger.warning(f"PRECISION CHANGED since checkpoint: {st.get('precision')} -> "
+                               f"{self.precision} (e.g. after an fp16 overflow abort); resuming "
+                               f"its weights and optimizer state anyway")
+            if st.get("max_steps") not in (None, self.max_steps):
+                logger.warning(f"max_steps changed since checkpoint: {st.get('max_steps')} -> {self.max_steps}")
+            self.max_step_time = float(st.get("max_step_time", 0.0))
+            self.routing_analysis_failures = int(st.get("routing_analysis_failures", 0))
+            if "rng" in st:
+                try:
+                    _set_rng_state(st["rng"])
+                except Exception:
+                    logger.exception("RNG state not restored (training continues)")
+
+        hist = checkpoint_dir / "routing_history.json"
+        if hist.exists():
+            with open(hist) as f:
+                self.routing_history = [RoutingSnapshot(**h) for h in json.load(f)]
 
         logger.info(f"Loaded checkpoint from {checkpoint_dir}")
-        logger.info(f"  State: epoch={self.state.epoch}, batch_idx={self.state.batch_idx}, "
-                   f"global_step={self.state.global_step}")
+        logger.info(f"  State: epoch={self.state.epoch}, samples_seen={self.state.samples_seen}, "
+                    f"global_step={self.state.global_step}")
+
+    # ------------------------------------------------------------- HF pushes
+
+    def _maybe_push_best(self, force: bool = False, blocking: bool = False) -> None:
+        if not self._best_dirty:
+            return
+        step = self.state.global_step
+        if not force and self._last_best_push_step is not None and \
+                step - self._last_best_push_step < 4 * self.save_steps:
+            return
+        if self.pusher.submit_dir("best_model", blocking=blocking):
+            self._best_dirty = False
+            self._last_best_push_step = step
+
+    def _push_on_deadline(self) -> None:
+        """Blocking: latest/ (resume state) + best_model/ if changed since last push."""
+        self._maybe_push_best(force=True, blocking=True)
+        self.pusher.submit_dir("latest", blocking=True)
+        self.pusher.wait()
+
+    def finalize_push(self) -> None:
+        """End of run (blocking): best_model, final_model, latest, root files, then
+        TRAINING_DONE last with an existence check. Called by the pipeline after
+        final_results.json is written."""
+        try:
+            if self.pusher.enabled:
+                self.pusher.wait()
+                self._maybe_push_best(force=True, blocking=True)
+                ok = self.pusher.submit_dir("final_model", blocking=True)
+                self.pusher.submit_dir("latest", blocking=True)
+                if (self.output_dir / "visualizations").is_dir():
+                    self.pusher.submit_dir("visualizations", blocking=True)
+                for fname in ("final_results.json", "eval_results.json", "routing_history.json",
+                              "final_examples.npz", "generation_results.json",
+                              "experiment_config.json", "data_stats.json"):
+                    self.pusher.upload_file(self.output_dir / fname)
+                if ok:
+                    if not self.pusher.upload_file(self.output_dir / TRAINING_DONE, verify=True):
+                        logger.error("TRAINING_DONE could not be pushed/verified on the Hub: "
+                                     "the chain may resubmit this run")
+                else:
+                    logger.error("final_model push failed: NOT pushing TRAINING_DONE")
+        finally:
+            self.pusher.shutdown()
+
+    def shutdown_push(self) -> None:
+        self.pusher.shutdown()
+
+    def push_latest_after_crash(self) -> None:
+        """Blocking push of the local latest/ (last periodic save, consistent by construction).
+        Never raises: the caller re-raises the original error."""
+        try:
+            if self.pusher.enabled and (self.output_dir / "latest").is_dir():
+                logger.warning("Training crashed: pushing the last local latest/ before exiting")
+                self.pusher.submit_dir("latest", blocking=True)
+            self.pusher.shutdown()
+        except Exception:
+            logger.exception("latest/ push after crash failed")
+
+    def _install_sigterm_handler(self) -> None:
+        """SIGTERM (scancel, forwarded by train.sbatch) -> stop at the next optimizer step through
+        the deadline path (save + blocking push of latest/)."""
+        def _handler(signum, frame):
+            logger.warning("SIGTERM received: stopping after the current optimizer step")
+            self._term_requested = True
+        try:
+            self._prev_sigterm = signal.signal(signal.SIGTERM, _handler)
+        except ValueError:  # not the main thread
+            self._prev_sigterm = None
+
+    def _restore_sigterm_handler(self) -> None:
+        """After the loop: final eval / pushes are not interruptible at a step boundary, so TERM
+        goes back to the default (process ends; latest/ was saved at the last save_steps)."""
+        prev = getattr(self, "_prev_sigterm", None)
+        if prev is not None:
+            try:
+                signal.signal(signal.SIGTERM, prev)
+            except ValueError:
+                pass
+            self._prev_sigterm = None
+
+    # ------------------------------------------------------------------ main
+
+    def _stop_for_deadline(self) -> bool:
+        if self.stop_at_step and self.state.global_step >= self.stop_at_step:
+            logger.warning(f"GLR_STOP_AT_STEP={self.stop_at_step} reached (test hook)")
+            self.stop_at_step = 0  # once per process
+            return True
+        return self._term_requested or not self.time_allows(0.0)
+
+    def train(self, resume_from_checkpoint: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Main loop: optimizer steps until `max_steps` or the deadline.
+
+        Args:
+            resume_from_checkpoint: Path to checkpoint to resume from, or "auto" to find latest
+        """
+        logger.info("=" * 60)
+        logger.info("Starting Gated LoRA Training" if self.is_gated else "Starting LoRA baseline training")
+        logger.info("=" * 60)
+        self._init_deadline()
+        self._install_sigterm_handler()
+
+        if self.is_training_done():
+            logger.info(f"{TRAINING_DONE} present in {self.output_dir}: nothing to do")
+            return {"status": "already_complete", "total_steps": self.state.global_step}
+
+        if resume_from_checkpoint:
+            checkpoint_path = None
+            if resume_from_checkpoint == "auto":
+                checkpoint_path = self.find_latest_checkpoint()
+                if checkpoint_path:
+                    logger.info(f"Auto-detected checkpoint: {checkpoint_path}")
+                else:
+                    logger.info("No checkpoint found, starting from scratch")
+            else:
+                checkpoint_path = Path(resume_from_checkpoint)
+            if checkpoint_path and checkpoint_path.exists():
+                self.load_checkpoint(str(checkpoint_path))
+                logger.info(f"Resuming at step {self.state.global_step}, epoch {self.state.epoch}, "
+                            f"sample {self.state.samples_seen}")
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            logger.info(f"Initial VRAM - Allocated: {torch.cuda.memory_allocated() / 1e9:.2f}GB, "
+                        f"Reserved: {torch.cuda.memory_reserved() / 1e9:.2f}GB")
+
+        start_time = time.time()
+        self.model.train()
+        self._set_model_attr("collect_routing_stats", self.collect_routing_stats)
+        self.optimizer.zero_grad(set_to_none=True)
+
+        progress_bar = None
+        if TQDM_AVAILABLE:
+            progress_bar = tqdm(total=self.max_steps, initial=self.state.global_step,
+                                desc="train", unit="step", dynamic_ncols=True, mininterval=30)
+
+        window = 0  # micro-batches in the current accumulation window (carried across epochs)
+        loss_sum: Optional[torch.Tensor] = None  # detached [4] sums since last log
+        n_micro = 0
+        grad_norm: Optional[torch.Tensor] = None
+        window_t0 = time.time()
+        hit_deadline = False
+        steps_this_job = 0
+
+        if self.state.global_step < self.max_steps and self._stop_for_deadline():
+            hit_deadline = True
+
+        while self.state.global_step < self.max_steps and not hit_deadline:
+            loader = self._train_loader()
+            got_batch = False
+            for batch in loader:
+                got_batch = True
+                if window == 0:
+                    window_t0 = time.time()
+                    self._update_reg_scale()
+                stats = self.train_step(batch)
+                am = batch["attention_mask"]  # CPU: no sync
+                self._tok_real += int(am.sum())
+                self._tok_total += am.numel()
+                loss_sum = stats if loss_sum is None else loss_sum + stats
+                n_micro += 1
+                bsz = int(batch["input_ids"].size(0))
+                self.state.samples_seen += bsz
+                self.state.total_samples_seen += bsz
+                self.state.batch_idx += 1
+                window += 1
+                if window < self.gradient_accumulation_steps:
+                    continue
+
+                # ---- optimizer step (full window) ----
+                window = 0
+                grad_norm = self._optimizer_step()
+                self.state.global_step += 1
+                steps_this_job += 1
+                step_time = time.time() - window_t0
+                if self._first_step_time is None:
+                    self._first_step_time = step_time
+                    if torch.cuda.is_available():
+                        logger.info(f"Peak VRAM after first step: "
+                                    f"{torch.cuda.max_memory_allocated() / 1e9:.2f}GB")
+                else:
+                    self.max_step_time = max(self.max_step_time, step_time)
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                step = self.state.global_step
+
+                if step % self.logging_steps == 0:
+                    self._log_train(loss_sum, n_micro, grad_norm, progress_bar)
+                    loss_sum, n_micro = None, 0
+
+                if step % self.eval_steps == 0 and step < self.max_steps:
+                    self._maybe_eval_for_selection()
+
+                if step % self.save_steps == 0 and step < self.max_steps:
+                    self.save_checkpoint("latest")
+
+                if (self.is_gated and self.routing_analysis_steps > 0
+                        and step % self.routing_analysis_steps == 0):
+                    self._routing_analysis_safely()
+
+                self._maybe_push_best()
+
+                if step >= self.max_steps:
+                    break
+                if self._stop_for_deadline():
+                    hit_deadline = True
+                    break
+            else:
+                # Epoch exhausted: leftovers in `window` carry into the next epoch.
+                if not got_batch and self.state.samples_seen == 0:
+                    raise RuntimeError(f"Train loader yielded no batch for epoch {self.state.epoch}")
+                logger.info(f"Epoch {self.state.epoch} done ({self.state.samples_seen} samples)")
+                self.state.epoch += 1
+                self.state.samples_seen = 0
+                self.state.batch_idx = 0
+
+        if progress_bar is not None:
+            progress_bar.close()
+        if loss_sum is not None:
+            self._log_train(loss_sum, n_micro, grad_norm, None)
+        if not hit_deadline:
+            self._restore_sigterm_handler()
+
+        if hit_deadline:
+            return self._exit_for_deadline(start_time, "training")
+
+        # ---- end of budget: selection eval, full evals, final save ----
+        self._maybe_eval_for_selection()
+        full_loaders = [self._eval_loader("val", None), self._eval_loader("final", None)]
+        need = sum(self._eval_seconds_estimate(l) for l in full_loaders)
+        if not self.time_allows(need):
+            logger.warning(f"Final evaluation (~{need / 60:.1f} min) does not fit before the deadline")
+            return self._exit_for_deadline(start_time, "final evaluation")
+
+        final_val = self.evaluate("val", None)
+        self._log_eval(final_val, "final_val")
+        final_test = self.evaluate("final", None, dump_path=self.output_dir / "final_examples.npz")
+        self._log_eval(final_test, "final_test")
+
+        generation: Dict[str, Any] = {}
+        if self.generation_tasks:
+            if self.time_allows(self._generation_seconds_estimate()):
+                generation = self.generation_eval("final")
+                with open(self.output_dir / "generation_results.json", "w") as f:
+                    json.dump(generation, f)
+            else:
+                logger.warning("Generation eval does not fit before the deadline")
+                return self._exit_for_deadline(start_time, "generation evaluation")
+
+        self._save_weights_dir("final_model")
+        self.save_checkpoint("latest")
+        eval_results = {
+            "val_full": final_val,
+            "final": final_test,
+            "generation": {t: {k: v for k, v in r.items()
+                               if k not in ("per_example", "predictions", "example_idx")}
+                           for t, r in generation.items()},
+            "best_eval_loss": self.state.best_eval_loss,
+            "best_eval_step": self.state.best_eval_step,
+            "selection_metric": "val mean task answer loss "
+                                f"({self.eval_samples_per_task} samples/task)",
+        }
+        with open(self.output_dir / "eval_results.json", "w") as f:
+            json.dump(eval_results, f, indent=2)
+        self._save_routing_history()
+        self._mark_training_done()
+
+        elapsed_time = time.time() - start_time
+        logger.info(f"\nTraining completed ({steps_this_job} steps this job, {elapsed_time / 60:.2f} min)")
+        return {
+            "status": "completed",
+            "final_train_loss": self.state.total_train_loss / max(self.state.num_train_steps, 1),
+            "final_eval_metrics": eval_results,
+            "best_eval_loss": self.state.best_eval_loss,
+            "best_eval_step": self.state.best_eval_step,
+            "total_steps": self.state.global_step,
+            "total_samples_seen": self.state.total_samples_seen,
+            "training_time_minutes": elapsed_time / 60,
+            "max_step_seconds": self.max_step_time,
+            "num_routing_snapshots": len(self.routing_history),
+            "routing_analysis_failures": self.routing_analysis_failures,
+            "precision": self.precision,
+        }
+
+    def _exit_for_deadline(self, start_time: float, phase: str) -> Dict[str, Any]:
+        elapsed = time.time() - start_time
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"DEADLINE: stopping during {phase} at step {self.state.global_step} "
+                    f"({elapsed / 60:.1f} min this job, max step {self.max_step_time:.2f}s)")
+        logger.info(f"{'=' * 60}")
+        self.save_checkpoint("latest")
+        self._push_on_deadline()
+        logger.info("Resume with --resume auto to continue training")
+        return {
+            "status": "time_limit",
+            "phase": phase,
+            "current_epoch": self.state.epoch,
+            "samples_seen": self.state.samples_seen,
+            "global_step": self.state.global_step,
+            "training_time_minutes": elapsed / 60,
+        }
+
+    def _mark_training_done(self):
+        """Create a marker file indicating training is complete."""
+        done_file = self.output_dir / TRAINING_DONE
+        with open(done_file, "w") as f:
+            f.write(f"Training completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total steps: {self.state.global_step}\n")
+            f.write(f"Best eval loss: {self.state.best_eval_loss} (step {self.state.best_eval_step})\n")
+        logger.info(f"Created {done_file}")
+
+    def is_training_done(self) -> bool:
+        """Check if training is already complete."""
+        return (self.output_dir / TRAINING_DONE).exists()
 
 
 def create_optimizer_and_scheduler(
@@ -1073,7 +1658,7 @@ def create_optimizer_and_scheduler(
         if not param.requires_grad:
             continue
 
-        if "gating" in name.lower() or "gate" in name.lower():
+        if "gating_network" in name:  # NOT "gate": that also matches the gate_proj experts
             gating_params.append(param)
         elif "expert" in name.lower() or "lora" in name.lower():
             expert_params.append(param)
@@ -1095,8 +1680,12 @@ def create_optimizer_and_scheduler(
     optimizer_name = getattr(config.training, "optimizer", "adamw").lower()
     weight_decay = getattr(config.training, "weight_decay", 0.01)
 
+    # fused AdamW on CUDA: one kernel, and GradScaler passes found_inf to it instead of a
+    # host sync per step (all trainable params are fp32 CUDA tensors, checked by the trainer)
+    on_cuda = all(p.is_cuda for g in param_groups for p in g["params"])
     if optimizer_name == "adamw":
-        optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay,
+                                      **({"fused": True} if on_cuda else {"foreach": True}))
     elif optimizer_name == "adam":
         optimizer = torch.optim.Adam(param_groups, lr=lr, weight_decay=weight_decay)
     elif optimizer_name == "sgd":
@@ -1107,7 +1696,7 @@ def create_optimizer_and_scheduler(
     # Create scheduler
     scheduler_name = getattr(config.training, "scheduler", "cosine").lower()
     warmup_ratio = getattr(config.training, "warmup_ratio", 0.1)
-    warmup_steps = int(num_training_steps * warmup_ratio)
+    warmup_steps = max(1, int(num_training_steps * warmup_ratio))
 
     if scheduler_name == "cosine":
         from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -1120,7 +1709,7 @@ def create_optimizer_and_scheduler(
         )
         cosine_scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=num_training_steps - warmup_steps,
+            T_max=max(1, num_training_steps - warmup_steps),
             eta_min=lr * 0.1,
         )
         scheduler = SequentialLR(

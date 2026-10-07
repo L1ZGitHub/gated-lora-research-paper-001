@@ -1,0 +1,25 @@
+# Validation smoke (scripts/slurm/validate_v2.sbatch): v2 path end to end in ~15 min,
+# incl. a stop at step 150 + exact resume (gated). Not a result. Never pushed (push_to_hub: false).
+extends:
+  - experiments/v2/v2_qwen25_05b_baseline_r66.yaml
+
+experiment_name: smoke_v2_qwen25_05b_baseline_r66
+
+data:
+  max_samples_per_task: 500
+  max_val_samples: 64
+  max_final_samples: 64
+
+training:
+  max_steps: 400
+  eval_steps: 100
+  eval_samples_per_task_during_training: 32
+  save_steps: 100
+  save_margin_seconds: 30
+  routing_analysis_steps: 100
+  routing_analysis_samples_per_task: 8
+  push_to_hub: false
+  generation_samples_per_task: 32
+
+output:
+  output_dir: ./outputs/smoke_v2_qwen25_05b_baseline_r66
