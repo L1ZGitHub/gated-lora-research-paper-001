@@ -16,12 +16,17 @@
 #   3. smoke gated: stop at step 150 (GLR_STOP_AT_STEP) + --resume auto to 400, and the same
 #      run uninterrupted (resume exactness: compare final val loss)
 #   4. smoke baseline r66 (PEFT path, generation), 5. smoke frozen gate (calibration)
+#   3c and 4 set GLR_BEST_EVAL_ALWAYS=1: the best-checkpoint eval reloads best_model/ even when
+#   it is the last step, so final_best must reproduce final (weights save/load round trip)
 # Code: $V/code (rsynced v2 tree, first on PYTHONPATH). Never pushes to HF (no HF_TOKEN).
 # No apostrophes in any VAR:? message (node bash bug).
 set -u
 echo "=== NODE $(hostname) $(date -Iseconds) ==="
+# Prefer the SLURM-allocated GPU (two jobs starting together would both pick the first idle one)
+ALLOC="${CUDA_VISIBLE_DEVICES:-}"; ALLOC="${ALLOC%%,*}"
 FREE_GPU=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
-    | awk -F', ' '$2 < 500 {print $1; exit}')
+    | awk -F', ' -v a="$ALLOC" '$2 < 500 {if ($1 == a) {print $1; f=1; exit} if (!first) first=$1}
+                                END {if (!f && first != "") print first}')
 if [ -z "$FREE_GPU" ]; then echo "!!! no idle GPU on $(hostname), giving up"; exit 75; fi
 export CUDA_VISIBLE_DEVICES="$FREE_GPU"
 nvidia-smi -i "$FREE_GPU" --query-gpu=name,memory.used --format=csv,noheader
@@ -84,7 +89,7 @@ step "3b smoke gated: resume to 400"
 smoke gated gated_resume --analyze-routing --resume auto
 mv "$OUT/gated_resume.log" "$OUT/gated_resume_part2.log"
 step "3c smoke gated: uninterrupted"
-smoke gated gated_straight --analyze-routing
+GLR_BEST_EVAL_ALWAYS=1 smoke gated gated_straight --analyze-routing
 step "3d resume exactness"
 $PY - "$W" <<'PYEOF'
 import json, sys
@@ -99,8 +104,32 @@ fi
 
 if want 4; then
 step "4 smoke baseline r66"
-smoke baseline_r66 baseline
+GLR_BEST_EVAL_ALWAYS=1 smoke baseline_r66 baseline
 fi
+
+step "best-checkpoint round trip"
+$PY - "$W" <<'PYEOF'
+import json, os, sys
+w = sys.argv[1]
+for k in ("gated_straight", "baseline"):
+    p = f"{w}/{k}/eval_results.json"
+    if not os.path.exists(p):
+        continue
+    r = json.load(open(p))
+    b = r.get("final_best") or {}
+    if not b.get("final"):
+        print(k, "final_best MISSING:", b)
+        continue
+    d = abs(b["final"]["mean_task_answer_loss"] - r["final"]["mean_task_answer_loss"])
+    last = json.load(open(f"{w}/{k}/final_results.json")).get("total_steps") \
+        if os.path.exists(f"{w}/{k}/final_results.json") else None
+    # best = last step: reloaded weights must reproduce final; else: a real best != last eval
+    verdict = ("OK" if d < 1e-3 else "MISMATCH") if b["step"] == last else "best != last (no equality expected)"
+    print(k, "best step", b["step"], "last step", last, "same_as_final", b["same_as_final"],
+          "gen", {t: round(g["mean"], 4) for t, g in (b.get("generation") or {}).items()},
+          f"|final - final_best| = {d:.2e}", verdict,
+          "files:", sorted(f for f in os.listdir(f"{w}/{k}") if "best" in f))
+PYEOF
 
 if want 5; then
 step "5 smoke frozen gate"

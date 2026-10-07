@@ -15,8 +15,9 @@
 # =====================================================================
 
 # Active v2 queues (launch with --queue):
-#   experiments/queue_v2_phase_a.txt  LR sweep, 12 runs
-#   experiments/queue_v2_phase_b.txt  main grid, after Phase A (see its header)
+#   experiments/queue_v2_phase_a.txt   LR sweep 1e-4..4e-4, 12 runs (done)
+#   experiments/queue_v2_phase_a2.txt  LR 5e-5, 4 runs (done)
+#   experiments/queue_v2_phase_b.txt   main grid at 5e-5 + 2.5e-5 check, 28 runs
 
 # =====================================================================
 # LEGACY v1 HISTORY — kept for reference only, all entries commented out.

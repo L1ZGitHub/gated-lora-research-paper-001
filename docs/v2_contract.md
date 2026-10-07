@@ -146,3 +146,13 @@ DATA exposes:
   `GLR_STOP_AT_STEP` test hook; padding efficiency logged.
 - Not done: `analysis/cluster/routing_maps_hf.py` still uses the legacy data API and legacy
   model defaults: port it to v2 (data + `gate_output_scale`) before the knockout test on v2 runs.
+
+## Phase B (2026-10-07)
+- Phase A (2 seeds x {5e-5, 1e-4, 2e-4, 4e-4}): 5e-5 best for both gated and r66 -> base LR
+  5e-5; the 2e-4 configs carry their LR explicitly. Frozen-gate target top-1 0.653 (trained
+  gates at 5e-5). Queue `experiments/queue_v2_phase_b.txt` (28 runs, incl. a 2.5e-5 check).
+- Best-checkpoint test eval: after the last-step evals, `best_model/` weights are loaded, the
+  final split (+ generation) re-evaluated, then the last-step weights restored. Results:
+  `eval_results.json["final_best"]` (`same_as_final` when best = last step; null if skipped
+  for the deadline), `final_examples_best.npz`, `generation_results_best.json`. Phase A runs
+  predate it (their seeds 0-1 at 5e-5 need an eval-only pass on `best_model/`).

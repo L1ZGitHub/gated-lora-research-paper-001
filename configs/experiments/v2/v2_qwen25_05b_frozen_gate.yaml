@@ -1,8 +1,8 @@
 # Control: FROZEN RANDOM gates (never trained), rescaled at init to a realistic sharpness.
 # Experts train under a fixed random routing. If quality, knockout faithfulness and maps match
-# the trained gate, learned routing buys nothing. frozen_gate_target_top1: placeholder from the
-# legacy trained gates (mean top-1 0.44-0.50); SET IT from the Phase A v2 gated runs
-# (final routing mean_top1_dominance) before launching Phase B. Regularisers off: no gate grads.
+# the trained gate, learned routing buys nothing. frozen_gate_target_top1 = mean final top-1 of
+# the trained gates at the Phase B LR (Phase A, gated lr 5e-5, 2 seeds: 0.653).
+# Regularisers off: no gate grads.
 extends:
   - models/qwen25_05b.yaml
   - tasks/all_8.yaml
@@ -12,7 +12,7 @@ experiment_name: v2_qwen25_05b_frozen_gate
 
 model:
   freeze_gating: true
-  frozen_gate_target_top1: 0.47
+  frozen_gate_target_top1: 0.653
   use_load_balancing: false
   use_l1_gate_regularization: false
 

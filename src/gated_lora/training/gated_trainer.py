@@ -166,6 +166,12 @@ def _set_rng_state(state: Dict[str, Any]) -> None:
         np.random.set_state((name, np.array(keys, dtype=np.uint32), pos, has_gauss, cached))
 
 
+def _generation_summary(generation: Dict[str, Any]) -> Dict[str, Any]:
+    """Per-task generation metrics without the per-example arrays (for eval_results.json)."""
+    return {t: {k: v for k, v in r.items() if k not in ("per_example", "predictions", "example_idx")}
+            for t, r in generation.items()}
+
+
 def _link_or_copy(src: str, dst: str) -> None:
     try:
         os.link(src, dst)
@@ -1296,12 +1302,9 @@ class GatedLoRATrainer:
                 return d
         return None
 
-    def load_checkpoint(self, path: str):
-        """Load a checkpoint: weights (both model families), optimizer, scheduler,
-        scaler, training state and RNG. Refuses to resume without weights."""
-        checkpoint_dir = Path(path)
-
-        # Load model state
+    def load_weights(self, checkpoint_dir: Path) -> None:
+        """Load trainable weights in place (both model families); nothing else."""
+        checkpoint_dir = Path(checkpoint_dir)
         if (checkpoint_dir / "model.pt").exists():
             state_dict = torch.load(
                 checkpoint_dir / "model.pt", map_location=self.device, weights_only=True
@@ -1332,13 +1335,19 @@ class GatedLoRATrainer:
             logger.info(f"Loaded PEFT adapter weights from {checkpoint_dir}")
         else:
             raise FileNotFoundError(
-                f"Cannot resume: no loadable model weights found in {checkpoint_dir} "
-                f"(looked for model.pt / expert_pools.pt+gating_network.pt / adapter_model.*). "
-                f"Resuming without weights would silently restart training."
+                f"No loadable model weights found in {checkpoint_dir} "
+                f"(looked for model.pt / expert_pools.pt+gating_network.pt / adapter_model.*); "
+                f"resuming without weights would silently restart training."
             )
         bad = [p.dtype for p in self.trainable_params if p.dtype != torch.float32]
         if bad:
             raise RuntimeError(f"Trainable params lost fp32 after loading weights: {set(bad)}")
+
+    def load_checkpoint(self, path: str):
+        """Load a checkpoint: weights (both model families), optimizer, scheduler,
+        scaler, training state and RNG. Refuses to resume without weights."""
+        checkpoint_dir = Path(path)
+        self.load_weights(checkpoint_dir)
 
         if (checkpoint_dir / "optimizer.pt").exists():
             self.optimizer.load_state_dict(
@@ -1427,7 +1436,8 @@ class GatedLoRATrainer:
                 budget = (self.deadline - time.time() - 60.0) if self.deadline else 3600.0
                 files = [self.output_dir / f for f in (
                     "final_results.json", "eval_results.json", "routing_history.json",
-                    "final_examples.npz", "generation_results.json", "experiment_config.json",
+                    "final_examples.npz", "generation_results.json", "final_examples_best.npz",
+                    "generation_results_best.json", "experiment_config.json",
                     "data_stats.json", "frozen_gate_calibration.json", TRAINING_DONE)]
                 ok = self.pusher.commit_final(
                     ["best_model", "final_model", "latest", "visualizations"], files,
@@ -1648,9 +1658,8 @@ class GatedLoRATrainer:
         eval_results = {
             "val_full": final_val,
             "final": final_test,
-            "generation": {t: {k: v for k, v in r.items()
-                               if k not in ("per_example", "predictions", "example_idx")}
-                           for t, r in generation.items()},
+            "generation": _generation_summary(generation),
+            "final_best": self._evaluate_best_checkpoint(final_test, generation),
             "best_eval_loss": self.state.best_eval_loss,
             "best_eval_step": self.state.best_eval_step,
             "selection_metric": "val mean task answer loss "
@@ -1677,6 +1686,45 @@ class GatedLoRATrainer:
             "routing_analysis_failures": self.routing_analysis_failures,
             "precision": self.precision,
         }
+
+    def _evaluate_best_checkpoint(self, final_test: Dict[str, Any],
+                                  generation: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Test split (+ generation) on the best_model/ weights (val selection), so both the
+        last-step and the selected checkpoint are reported. Runs after final_model/ and
+        latest/ are saved and restores the last-step weights. Non-fatal: None when skipped."""
+        step = self.state.best_eval_step
+        # GLR_BEST_EVAL_ALWAYS=1 (test hook): reload even when best = last step, so the result
+        # must reproduce `final` (save/load round trip check in validate_v2.sbatch)
+        if step == self.state.global_step and not os.environ.get("GLR_BEST_EVAL_ALWAYS"):
+            return {"step": step, "same_as_final": True, "final": final_test,
+                    "generation": _generation_summary(generation)}
+        best_dir = self.output_dir / "best_model"
+        if step < 0 or not best_dir.is_dir():
+            logger.warning("No best_model/ checkpoint: best-checkpoint test eval skipped")
+            return None
+        need = self._eval_seconds_estimate(self._eval_loader("final", None))
+        if self.generation_tasks:
+            need += self._generation_seconds_estimate()
+        if not self.time_allows(need):
+            logger.warning(f"Best-checkpoint test eval (~{need / 60:.1f} min) skipped: deadline too close")
+            return None
+        logger.info(f"Best checkpoint (step {step}): test split + generation")
+        try:  # optional result: a failure here must not fail (and re-run) a finished run
+            self.load_weights(best_dir)
+            test = self.evaluate("final", None, dump_path=self.output_dir / "final_examples_best.npz")
+            self._log_eval(test, "final_test_best")
+            gen = self.generation_eval("final") if self.generation_tasks else {}
+            if gen:
+                with open(self.output_dir / "generation_results_best.json", "w") as f:
+                    json.dump(gen, f)
+            result = {"step": step, "same_as_final": False, "final": test,
+                      "generation": _generation_summary(gen)}
+        except Exception:
+            logger.exception("Best-checkpoint test eval failed (run results unaffected)")
+            result = None
+        finally:  # later analysis (routing) must see the last-step weights
+            self.load_weights(self.output_dir / "final_model")
+        return result
 
     def _exit_for_deadline(self, start_time: float, phase: str) -> Dict[str, Any]:
         elapsed = time.time() - start_time

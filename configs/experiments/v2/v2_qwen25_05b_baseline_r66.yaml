@@ -12,6 +12,8 @@ model:
   model_type: baseline
   lora_r: 66
   lora_alpha: 132
+training:
+  learning_rate: 2.0e-4  # Phase A point; base/v2.yaml moved to 5e-5
 
 output:
   output_dir: ./outputs/v2_qwen25_05b_baseline_r66

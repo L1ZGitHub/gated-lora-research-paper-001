@@ -23,7 +23,7 @@ training:
   max_steps: 5000
   batch_size: 8
   gradient_accumulation_steps: 4
-  learning_rate: 2.0e-4
+  learning_rate: 5.0e-5  # Phase A (2 seeds x 4 LRs): best for both gated and r66
   warmup_ratio: 0.1
   scheduler: cosine
   save_steps: 500
