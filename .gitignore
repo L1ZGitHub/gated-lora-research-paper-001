@@ -65,3 +65,6 @@ htmlcov/
 # Lock files (uv handles these)
 # uv.lock IS committed
 *:Zone.Identifier
+
+# Figure previews (the PDFs are the paper figures)
+figures/*.png
