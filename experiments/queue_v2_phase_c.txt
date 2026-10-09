@@ -1,0 +1,4 @@
+# v2 Phase C: settle the rank curve before writing. The single r32 seed had the best test loss
+# of every run (0.7753 vs gated 0.7794); r16 has one seed too. Seed 0 of both exists (Phase B).
+configs/experiments/v2/v2_qwen25_05b_baseline_r32.yaml 1 2 3 4
+configs/experiments/v2/v2_qwen25_05b_baseline_r16.yaml 1 2 3 4
