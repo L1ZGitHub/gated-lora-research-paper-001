@@ -34,9 +34,19 @@ P = "v2_qwen25_05b_"
 logger = logging.getLogger("knockout")
 
 
-def run_knockout(run: str, out_dir: Path) -> None:
+def parse_condition(name: str):
+    """"none" or "ko<experts>_<block>", e.g. ko2_late (expert 2), ko01_all (experts 0 and 1)."""
+    if name == "none":
+        return None, "all"
+    experts, block = name[2:].split("_", 1)
+    ex = [int(c) for c in experts]
+    return (ex[0] if len(ex) == 1 else ex), block
+
+
+def run_knockout(run: str, out_dir: Path, split: str = "final", cond_names=None,
+                 tag: str = "") -> None:
     cfg_name, seed = run.rsplit("_seed", 1)
-    out_file = out_dir / f"{run}.json"
+    out_file = out_dir / f"{run}{tag}.json"
     if out_file.exists():
         logger.info(f"{run}: done already, skip")
         return
@@ -60,7 +70,8 @@ def run_knockout(run: str, out_dir: Path) -> None:
     trainer.load_weights(Path(snap) / f"{P}{run}" / "final_model")
     logged = json.load(open(snapshot_download(
         REPO, repo_type="dataset", allow_patterns=[f"{P}{run}/eval_results.json"],
-        local_dir=str(work / "hf")) + f"/{P}{run}/eval_results.json"))["final"]
+        local_dir=str(work / "hf")) + f"/{P}{run}/eval_results.json"))[
+        "final" if split == "final" else "val_full"]
 
     gn = model.gating_network
     orig = gn.compute_gate_weights
@@ -77,14 +88,18 @@ def run_knockout(run: str, out_dir: Path) -> None:
     L = model.num_layers if hasattr(model, "num_layers") else len(model.expert_pools)
     blocks = {"all": range(L), "early": range(0, L // 3), "mid": range(L // 3, 2 * L // 3),
               "late": range(2 * L // 3, L)}
-    conds = [("none", None, "all")] + [(f"ko{e}_{b}", e, b) for e in range(model.num_experts)
-                                       for b in blocks]
-    res = {"run": run, "num_layers": L, "blocks": {b: list(r) for b, r in blocks.items()},
+    if cond_names is None:  # default grid: each expert x each block
+        cond_names = ["none"] + [f"ko{e}_{b}" for e in range(model.num_experts) for b in blocks]
+    conds = [(n, *parse_condition(n)) for n in cond_names]
+    if conds[0][0] != "none":
+        conds.insert(0, ("none", None, "all"))  # the intact reference is always evaluated first
+    res = {"run": run, "split": split, "num_layers": L,
+           "blocks": {b: list(r) for b, r in blocks.items()},
            "logged_final": logged["mean_task_answer_loss"], "conditions": {}}
     for name, e, b in conds:
         state["expert"], state["layers"] = e, set(blocks[b])
         t0 = time.time()
-        m = trainer.evaluate("final", None)
+        m = trainer.evaluate(split, None)
         res["conditions"][name] = {"expert": e, "block": b,
                                    "mean_task_answer_loss": m["mean_task_answer_loss"],
                                    "per_task": {t: v["answer_loss"] for t, v in m["per_task"].items()}}
@@ -94,7 +109,7 @@ def run_knockout(run: str, out_dir: Path) -> None:
             logger.info(f"{run}: intact {m['mean_task_answer_loss']:.4f} vs logged "
                         f"{logged['mean_task_answer_loss']:.4f} (|d| {d:.1e})")
             if d > 2e-3:
-                raise RuntimeError(f"{run}: intact model does not reproduce the logged test loss")
+                raise RuntimeError(f"{run}: intact model does not reproduce the logged {split} loss")
     out_file.write_text(json.dumps(res, indent=1))
     logger.info(f"{run}: saved {out_file}")
     del trainer, model
@@ -106,12 +121,17 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", nargs="+", required=True)
     ap.add_argument("--out-dir", default="ko_results")
+    ap.add_argument("--split", default="final", choices=["final", "val"],
+                    help="final = test split; val = held-out val split (to choose a policy)")
+    ap.add_argument("--conditions", nargs="+", default=None,
+                    help="e.g. none ko01_all ko2_mid (default: each expert x each block)")
+    ap.add_argument("--tag", default="", help="suffix of the output file name")
     args = ap.parse_args()
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("WANDB_MODE", "disabled")
     for run in args.runs:
-        run_knockout(run, out)
+        run_knockout(run, out, args.split, args.conditions, args.tag)
 
 
 if __name__ == "__main__":

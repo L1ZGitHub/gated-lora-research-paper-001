@@ -6,6 +6,7 @@
              whether it survives on test.
   knockout:  (--knockout DIR, output of knockout_v2.py) does the damage of removing an expert
              follow its routing weight across tasks?
+  pertask:   (--pertask DIR) per-task expert removal chosen on val, scored on test
   routing:   Q2 from final_examples.npz (per-example gate means over answer tokens [N, L, E]):
              - expected rank E[r] = sum_e w_e r_e per task x layer (routing map), per seed
              - difficulty -> rank: Spearman across tasks (task loss vs E[r]) and within task
@@ -186,13 +187,54 @@ def knockout(ko_dir: str) -> dict:
     return out
 
 
+def pertask(ko_dir: str) -> dict:
+    """Per-task expert removal chosen on VAL, scored on TEST (choosing on test would overstate
+    the gain). Input: knockout_v2.py --split val/final --tag _val/_final outputs."""
+    import glob
+    import os
+    base = {}
+    for b, (cfg, seeds, _) in (("r66", ARMS["r66"]), ("r56", ARMS["r56"])):
+        base[b] = np.mean([json.load(open(get(f"{cfg}_seed{x}", "eval_results.json")))["final"]
+                           ["mean_task_answer_loss"] for x in seeds])
+    out = {}
+    for fv in sorted(glob.glob(os.path.join(ko_dir, "*_val.json"))):
+        v = json.load(open(fv))
+        f = json.load(open(fv.replace("_val.json", "_final.json")))
+        tasks = sorted(v["conditions"]["none"]["per_task"])
+        pick = {t: min(v["conditions"], key=lambda c: v["conditions"][c]["per_task"][t]) for t in tasks}
+        test_pick = {t: f["conditions"][pick[t]]["per_task"][t] for t in tasks}
+        out[v["run"]] = {"pick": pick, "intact": f["conditions"]["none"]["mean_task_answer_loss"],
+                         "per_task_policy": float(np.mean(list(test_pick.values()))),
+                         "test_per_task_pick": test_pick,
+                         "test_per_task_intact": f["conditions"]["none"]["per_task"],
+                         "uniform": {c: f["conditions"][c]["mean_task_answer_loss"] for c in f["conditions"]}}
+    runs = sorted(out)
+    print(f"\n== Per-task expert removal chosen on val, scored on test ({len(runs)} gated seeds)")
+    print(f"  test macro loss: intact {np.mean([out[r]['intact'] for r in runs]):.4f} | "
+          f"val-chosen per task {np.mean([out[r]['per_task_policy'] for r in runs]):.4f} | "
+          f"r66 {base['r66']:.4f} | r56 {base['r56']:.4f}")
+    print("  same removal for every task (test macro, mean over seeds):")
+    for c in out[runs[0]]["uniform"]:
+        print(f"    {c:12s} {np.mean([out[r]['uniform'][c] for r in runs]):.4f}")
+    tasks = sorted(out[runs[0]]["pick"])
+    print("  per task: choice on val in each seed | test change vs intact (mean over seeds)")
+    for t in tasks:
+        d = np.mean([out[r]["test_per_task_pick"][t] - out[r]["test_per_task_intact"][t] for r in runs])
+        print(f"    {t:14s} {' '.join(f'{out[r]['pick'][t]:>10s}' for r in runs)}   {d:+.4f}")
+    out["_baselines_test"] = base
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="analysis_v2.json")
     ap.add_argument("--routing-only", action="store_true")
     ap.add_argument("--knockout", metavar="DIR", help="only the knockout faithfulness analysis")
+    ap.add_argument("--pertask", metavar="DIR", help="only the per-task removal policy analysis")
     args = ap.parse_args()
-    if args.knockout:
+    if args.pertask:
+        res = {"pertask": pertask(args.pertask)}
+    elif args.knockout:
         res = {"knockout": knockout(args.knockout)}
     elif args.routing_only:
         res = {"routing": routing()}
