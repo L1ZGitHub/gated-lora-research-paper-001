@@ -209,7 +209,8 @@ def pertask(ko_dir: str) -> dict:
                          "test_per_task_intact": f["conditions"]["none"]["per_task"],
                          "uniform": {c: f["conditions"][c]["mean_task_answer_loss"] for c in f["conditions"]}}
     runs = sorted(out)
-    print(f"\n== Per-task expert removal chosen on val, scored on test ({len(runs)} gated seeds)")
+    arm = runs[0].rsplit("_seed", 1)[0]
+    print(f"\n== Per-task removal chosen on val, scored on test ({arm}, {len(runs)} seeds)")
     print(f"  test macro loss: intact {np.mean([out[r]['intact'] for r in runs]):.4f} | "
           f"val-chosen per task {np.mean([out[r]['per_task_policy'] for r in runs]):.4f} | "
           f"r66 {base['r66']:.4f} | r56 {base['r56']:.4f}")

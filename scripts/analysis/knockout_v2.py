@@ -35,10 +35,13 @@ logger = logging.getLogger("knockout")
 
 
 def parse_condition(name: str):
-    """"none" or "ko<experts>_<block>", e.g. ko2_late (expert 2), ko01_all (experts 0 and 1)."""
+    """"none" or "ko<experts>_<block>", e.g. ko2_late (expert 2), ko01_all (experts 0 and 1),
+    koA_mid (the whole adapter: plain-LoRA baselines)."""
     if name == "none":
         return None, "all"
     experts, block = name[2:].split("_", 1)
+    if experts == "A":
+        return "A", block
     ex = [int(c) for c in experts]
     return (ex[0] if len(ex) == 1 else ex), block
 
@@ -73,21 +76,42 @@ def run_knockout(run: str, out_dir: Path, split: str = "final", cond_names=None,
         local_dir=str(work / "hf")) + f"/{P}{run}/eval_results.json"))[
         "final" if split == "final" else "val_full"]
 
-    gn = model.gating_network
-    orig = gn.compute_gate_weights
     state = {"expert": None, "layers": set()}
+    if config.model.model_type == "baseline":
+        # Plain LoRA (PEFT): "koA_<block>" sets the LoRA scaling of every target module of the
+        # block's layers to 0 (same effect as a gate weight of 0: the delta is removed).
+        import re
+        lora = [(int(re.search(r"layers\.(\d+)\.", n).group(1)), m) for n, m in model.named_modules()
+                if isinstance(getattr(m, "scaling", None), dict) and hasattr(m, "lora_A")
+                and re.search(r"layers\.(\d+)\.", n)]
+        saved = [dict(m.scaling) for _, m in lora]
+        L = 1 + max(i for i, _ in lora)
 
-    def patched(hidden_states, layer_idx=0, *a, **kw):
-        gw, gl, info = orig(hidden_states, layer_idx, *a, **kw)
-        if state["expert"] is not None and layer_idx in state["layers"]:
-            gw = gw.clone()
-            gw[..., state["expert"]] = 0
-        return gw, gl, info
+        def apply_state():
+            for (i, m), sc in zip(lora, saved):
+                off = state["expert"] == "A" and i in state["layers"]
+                for k in m.scaling:
+                    m.scaling[k] = 0.0 if off else sc[k]
+    else:
+        gn = model.gating_network
+        orig = gn.compute_gate_weights
 
-    gn.compute_gate_weights = patched
-    L = model.num_layers if hasattr(model, "num_layers") else len(model.expert_pools)
+        def patched(hidden_states, layer_idx=0, *a, **kw):
+            gw, gl, info = orig(hidden_states, layer_idx, *a, **kw)
+            if state["expert"] is not None and layer_idx in state["layers"]:
+                gw = gw.clone()
+                gw[..., state["expert"]] = 0
+            return gw, gl, info
+
+        gn.compute_gate_weights = patched
+        L = model.num_layers if hasattr(model, "num_layers") else len(model.expert_pools)
+
+        def apply_state():
+            pass
     blocks = {"all": range(L), "early": range(0, L // 3), "mid": range(L // 3, 2 * L // 3),
               "late": range(2 * L // 3, L)}
+    if cond_names is None and config.model.model_type == "baseline":
+        cond_names = ["none"] + [f"koA_{b}" for b in blocks]
     if cond_names is None:  # default grid: each expert x each block
         cond_names = ["none"] + [f"ko{e}_{b}" for e in range(model.num_experts) for b in blocks]
     conds = [(n, *parse_condition(n)) for n in cond_names]
@@ -98,6 +122,7 @@ def run_knockout(run: str, out_dir: Path, split: str = "final", cond_names=None,
            "logged_final": logged["mean_task_answer_loss"], "conditions": {}}
     for name, e, b in conds:
         state["expert"], state["layers"] = e, set(blocks[b])
+        apply_state()
         t0 = time.time()
         m = trainer.evaluate(split, None)
         res["conditions"][name] = {"expert": e, "block": b,
@@ -124,7 +149,8 @@ def main() -> None:
     ap.add_argument("--split", default="final", choices=["final", "val"],
                     help="final = test split; val = held-out val split (to choose a policy)")
     ap.add_argument("--conditions", nargs="+", default=None,
-                    help="e.g. none ko01_all ko2_mid (default: each expert x each block)")
+                    help="e.g. none ko01_all ko2_mid; koA_mid for plain LoRA "
+                         "(default: each expert x each block; baselines: koA_<block>)")
     ap.add_argument("--tag", default="", help="suffix of the output file name")
     args = ap.parse_args()
     out = Path(args.out_dir)
