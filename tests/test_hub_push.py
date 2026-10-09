@@ -77,3 +77,45 @@ def test_no_commit_without_local_training_done(tmp_path):
     assert not p.commit_final(["final_model"], [out / TRAINING_DONE], budget_s=10)
     p.shutdown()
     assert api.commits == []
+
+
+class _Resp:
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+
+class _HttpErr(Exception):
+    def __init__(self, status):
+        super().__init__(f"{status} Client Error")
+        self.response = _Resp(status)
+
+
+@pytest.mark.parametrize("exc", [_HttpErr(401), _HttpErr(403),
+                                 RuntimeError("Invalid user token. The token is invalid.")])
+def test_auth_error_is_not_retried(tmp_path, monkeypatch, exc):
+    """A revoked token used to be retried until the slice deadline (3.5 h lost per run)."""
+    monkeypatch.setattr("time.sleep", lambda s: pytest.fail("must not sleep/retry on 401/403"))
+    p = _HubPusher(tmp_path, "r/x", "run", True)
+    calls = []
+
+    def fail():
+        calls.append(1)
+        raise exc
+
+    with pytest.raises(type(exc)):
+        p._retry("x", fail, budget_s=3600)
+    assert len(calls) == 1
+
+
+def test_rate_limit_is_still_retried(tmp_path, monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    p = _HubPusher(tmp_path, "r/x", "run", True)
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise _HttpErr(429)
+
+    p._retry("x", flaky, budget_s=3600)
+    assert len(calls) == 3

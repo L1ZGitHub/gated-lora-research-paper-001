@@ -154,6 +154,24 @@ glr_load_token() {
         exit 2
     fi
     export HF_TOKEN="$tok"
+    glr_check_token
+}
+
+# Fail fast on a token HF rejects (401/403): exit 78 stops the chain instead of training for
+# hours and then retrying the final upload until the deadline. Network errors only warn.
+# The token goes through curl's stdin config, never argv (visible in ps on shared nodes).
+glr_check_token() {
+    local code
+    command -v curl >/dev/null 2>&1 || { glr_log "[token] curl missing: token not checked"; return 0; }
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" | \
+        curl -s -o /dev/null -w "%{http_code}" -m 30 -K - https://huggingface.co/api/whoami-v2) || true
+    case "$code" in
+        200) glr_log "[token] valid (HF whoami 200)" ;;
+        401|403)
+            glr_log "[token] FATAL: HF rejects the token (HTTP $code): revoked or expired; put a valid one in ${GLR_HF_TOKEN_FILE:-$HOME/.hf_token}" >&2
+            exit 78 ;;
+        *) glr_log "[token] WARNING: token check inconclusive (HTTP ${code:-none}), continuing" ;;
+    esac
 }
 
 # Live job ids (one per line). Non-zero if squeue fails or looks wrong.
@@ -556,12 +574,20 @@ if best_local is not None and (hf_step is None or best_local[0] > hf_step):
     log(f"using LOCAL candidate step={best_local[0]} ({best_local[1]})")
     shutil.move(best_local[1], target)
     used = best_local[1]
+    src_best = os.path.join(os.path.dirname(used), "best_model")
+    if os.path.isdir(src_best):  # needed by the best-checkpoint test eval at the end
+        shutil.move(src_best, os.path.join(out, "best_model"))
+        log(f"carried best_model/ from {src_best}")
 else:
     pull = os.path.join(out, ".hf_pull")
     log(f"pulling HF {run}/latest/ (step={hf_step})")
-    hf(lambda: snapshot_download(repo, repo_type="dataset", allow_patterns=[f"{run}/latest/*"],
+    hf(lambda: snapshot_download(repo, repo_type="dataset",
+                                 allow_patterns=[f"{run}/latest/*", f"{run}/best_model/*"],
                                  local_dir=pull), "latest download")
     shutil.move(os.path.join(pull, run, "latest"), target)
+    if os.path.isdir(os.path.join(pull, run, "best_model")):
+        shutil.move(os.path.join(pull, run, "best_model"), os.path.join(out, "best_model"))
+        log("pulled best_model/ from HF")
     shutil.rmtree(pull, ignore_errors=True)
     got = step_of(target)
     if got != hf_step:

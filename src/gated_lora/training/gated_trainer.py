@@ -172,6 +172,15 @@ def _generation_summary(generation: Dict[str, Any]) -> Dict[str, Any]:
             for t, r in generation.items()}
 
 
+def _auth_error(exc: BaseException) -> bool:
+    """True for an HF 401/403 (revoked, expired or read-only token)."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in (401, 403):
+        return True
+    msg = str(exc)
+    return "401 Client Error" in msg or "403 Client Error" in msg or "Invalid user token" in msg
+
+
 def _link_or_copy(src: str, dst: str) -> None:
     try:
         os.link(src, dst)
@@ -227,6 +236,10 @@ class _HubPusher:
                 return
             except Exception as exc:
                 msg = str(exc)
+                if _auth_error(exc):  # revoked/invalid token: retrying cannot help
+                    logger.error(f"[hf-push] {what}: HF rejected the token "
+                                 f"({type(exc).__name__}); not retrying")
+                    raise
                 if "429" in msg or "rate limit" in msg.lower():
                     delay = max(delay, self.RATE_LIMIT_DELAY)
                 if budget is None:
