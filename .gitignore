@@ -68,3 +68,11 @@ htmlcov/
 
 # Figure previews (the PDFs are the paper figures)
 figures/*.png
+
+# LaTeX build outputs (paper/main.pdf is rebuilt from main.tex)
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/main.pdf
