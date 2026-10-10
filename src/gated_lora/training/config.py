@@ -236,7 +236,7 @@ class DataConfig:
     shuffle_seed: int = 42
 
     # v2 data pipeline (read by MultiTaskDatasetLoader)
-    data_format: str = "v2"  # "v2" (prompt/answer) | "legacy"
+    data_format: str = "v2"  # "v2" (prompt/answer) | "v3" (v2 + official val/test) | "legacy"
     answer_only_loss: bool = True
     val_fraction: float = 0.05  # seeded slice of TRAIN used for checkpoint selection
     length_bucketing: bool = False
@@ -348,9 +348,9 @@ class ExperimentConfig:
                     "hooks would run twice and the gating cache would be stale). Disable it."
                 )
             print("WARNING: gradient_checkpointing is ignored (always off in v2)")
-        if d.data_format == "v2" and t.max_steps <= 0:
+        if d.data_format in ("v2", "v3") and t.max_steps <= 0:
             raise ValueError(
-                "v2 configs (data.data_format='v2') require training.max_steps > 0 "
+                f"{d.data_format} configs require training.max_steps > 0 "
                 "(num_epochs is only used by legacy configs)"
             )
         if t.gating_warmup_steps > 0 or t.gating_warmup_epochs > 0:
@@ -374,6 +374,8 @@ class ExperimentConfig:
             missing = [x for x in t.generation_tasks if x not in d.task_datasets]
             if missing:
                 raise ValueError(f"training.generation_tasks {missing} not in data.tasks")
+        if t.learning_rate is None or not float(t.learning_rate) > 0:
+            raise ValueError(f"training.learning_rate must be > 0, got {t.learning_rate!r}")
         if m.freeze_gating and m.model_type != "gated":
             raise ValueError("model.freeze_gating only applies to gated models")
         if m.frozen_gate_target_top1 is not None:

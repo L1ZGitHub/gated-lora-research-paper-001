@@ -1,0 +1,9 @@
+# v3 = v2 + clean held-out splits (experiments/README.md, v3 protocol).
+# v2's val split WikiText row by row (val paragraphs shared articles with train), so val
+# rewarded memorising training documents and stopped tracking test. Put LAST in `extends`.
+extends:
+  - base/v2.yaml
+data:
+  data_format: v3   # WikiText / CoNLL / XSum: official validation = val, official test = final
+training:
+  learning_rate: null  # every v3 config sets its own (Phase A' sweep per arm)

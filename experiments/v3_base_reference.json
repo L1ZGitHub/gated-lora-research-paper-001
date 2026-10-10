@@ -1,0 +1,44 @@
+{
+ "config": "configs/experiments/v3/v3_qwen25_05b_baseline_r32_lr5em5.yaml",
+ "data_format": "v3",
+ "val": {
+  "commonsenseqa": 1.0011174486141012,
+  "conll2003": 2.244712360530255,
+  "gsm8k": 0.906597487278051,
+  "imdb": 3.487599390506744,
+  "mnli": 8.639803086531447,
+  "squad": 0.6232923454572172,
+  "wikitext": 3.0670102976027596,
+  "xsum": 2.0481193133216857
+ },
+ "val_num_examples": {
+  "commonsenseqa": 487,
+  "conll2003": 500,
+  "gsm8k": 374,
+  "imdb": 500,
+  "mnli": 500,
+  "squad": 500,
+  "wikitext": 500,
+  "xsum": 500
+ },
+ "final": {
+  "commonsenseqa": 0.9819301330016194,
+  "conll2003": 2.5333208748516856,
+  "gsm8k": 0.9630844042333032,
+  "imdb": 3.4998866846561434,
+  "mnli": 8.632854820518363,
+  "squad": 0.6758675828471519,
+  "wikitext": 3.043657361182939,
+  "xsum": 2.05581566988615
+ },
+ "final_num_examples": {
+  "commonsenseqa": 1000,
+  "conll2003": 1000,
+  "gsm8k": 1000,
+  "imdb": 1000,
+  "mnli": 1000,
+  "squad": 1000,
+  "wikitext": 1000,
+  "xsum": 1000
+ }
+}

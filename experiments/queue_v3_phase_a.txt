@@ -1,0 +1,13 @@
+# v3 Phase A' (experiments/README.md, v3 protocol): LR per arm on the clean val split, seed 0.
+configs/experiments/v3/v3_qwen25_05b_gated_lr2p5em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_gated_lr5em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_gated_lr1em4.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r66_lr2p5em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r66_lr5em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r66_lr1em4.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r32_lr2p5em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r32_lr5em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r32_lr1em4.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r16_lr2p5em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r16_lr5em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r16_lr1em4.yaml 0

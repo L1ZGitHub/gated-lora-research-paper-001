@@ -90,3 +90,24 @@ def test_v2_run_names_cannot_collide_with_v1():
         assert p.stem.startswith("v2_"), p.name
         assert p.stem not in v1_names
         assert load_config(p)["experiment_name"] == p.stem
+
+
+V3_EXPERIMENTS = _all_yaml_files("experiments/v3")
+
+
+@pytest.mark.parametrize("path", V3_EXPERIMENTS, ids=lambda p: p.stem)
+def test_v3_experiment_configs_validate(path):
+    """v3: clean held-out splits and an explicit LR per config."""
+    config = dict_to_experiment_config(load_config(path))
+    config.seed = config.training.seed = 0
+    config.validate()
+    assert config.data.data_format == "v3"
+    assert load_config(path)["training"].get("learning_rate") is not None
+
+
+def test_v3_run_names_are_prefixed():
+    assert V3_EXPERIMENTS, "no v3 experiment configs found"
+    older = {p.stem for p in _all_yaml_files("experiments") + V2_EXPERIMENTS}
+    for p in V3_EXPERIMENTS:
+        assert p.stem.startswith("v3_") and p.stem not in older, p.name
+        assert load_config(p)["experiment_name"] == p.stem

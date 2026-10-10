@@ -1,5 +1,5 @@
 """
-Multi-task dataset loader for Gated LoRA experiments (data_format "v2").
+Multi-task dataset loader for Gated LoRA experiments (data_format "v2" or "v3").
 
 Tasks (8): SQuAD, IMDB, CoNLL-2003, WikiText-2, GSM8K, XSum, CommonsenseQA, MNLI.
 
@@ -29,6 +29,13 @@ Splits ("roles")
 * ``"final"``: the official evaluation split (validation; IMDB and GSM8K: test, MNLI:
   validation_matched), seeded subset (``split_seed``) capped at ``max_final_samples``.
   Used ONLY for final reporting.
+* data_format "v3" (same examples and tokenisation): tasks that ship an official validation
+  AND a labelled test split (WikiText-2, CoNLL-2003, XSum; ``TaskSpec.heldout_splits``) use
+  the official validation as "val" and the official test as "final", and train on the whole
+  official train split. v2 split those three row by row, which put val paragraphs of WikiText
+  in the same articles as train paragraphs: val then rewarded memorising training documents
+  and stopped tracking the test loss. The other tasks keep the v2 train-slice val (SQuAD and
+  MNLI group-level; GSM8K, CommonsenseQA and IMDB have no measurable val/train overlap).
 
 Subsets are selected by index BEFORE formatting/tokenising (whole splits are never
 formatted). Tokenised subsets are cached on disk (``cache_dir``, default
@@ -76,6 +83,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 DATA_FORMAT = "v2"
+DATA_FORMATS = ("v2", "v3")  # v3: official val/test splits where they exist (see docstring)
 # Bump when a formatter / tokenisation rule changes: invalidates the on-disk cache.
 FORMAT_REVISION = 1
 ROLES = ("train", "val", "final")
@@ -227,6 +235,8 @@ class TaskSpec:
     final_split: str
     train_split: str = "train"
     group_column: Optional[str] = None  # val/train partition at this group level
+    # data_format v3: (val, final) official splits, both disjoint from train by construction
+    heldout_splits: Optional[Tuple[str, str]] = None
 
 
 TASK_SPECS: Dict[str, TaskSpec] = {
@@ -237,13 +247,15 @@ TASK_SPECS: Dict[str, TaskSpec] = {
     # 2026-07-02: same schema/tag order, real split sizes 14041/3250/3453.
     "conll2003": TaskSpec([("eriktks/conll2003", None, {"revision": "refs/convert/parquet"}),
                            ("tomaarsen/conll2003", None, {})],
-                          format_conll_example, "validation"),
+                          format_conll_example, "validation",
+                          heldout_splits=("validation", "test")),
     "wikitext": TaskSpec([("wikitext", "wikitext-2-raw-v1", {})], format_wikitext_example,
-                         "validation"),
+                         "validation", heldout_splits=("validation", "test")),
     "gsm8k": TaskSpec([("gsm8k", "main", {})], format_gsm8k_example, "test"),
     "xsum": TaskSpec([("EdinburghNLP/xsum", None, {}),
                       ("EdinburghNLP/xsum", None, {"revision": "refs/convert/parquet"})],
-                     format_xsum_example, "validation"),
+                     format_xsum_example, "validation",
+                     heldout_splits=("validation", "test")),
     "commonsenseqa": TaskSpec([("commonsense_qa", None, {})], format_commonsenseqa_example,
                               "validation"),
     "mnli": TaskSpec([("glue", "mnli", {})], format_mnli_example, "validation_matched",
@@ -495,8 +507,8 @@ class MultiTaskDatasetLoader:
         split_seed: int = 0,
         max_eval_samples_per_task: Optional[int] = None,  # deprecated alias of max_val_samples
     ):
-        if data_format != DATA_FORMAT:
-            raise ValueError(f"data_format={data_format!r} not supported (only {DATA_FORMAT!r})")
+        if data_format not in DATA_FORMATS:
+            raise ValueError(f"data_format={data_format!r} not supported (one of {DATA_FORMATS})")
         if not 0.0 < val_fraction < 1.0:
             raise ValueError(f"val_fraction must be in (0, 1), got {val_fraction}")
         self.tokenizer = tokenizer
@@ -633,13 +645,28 @@ class MultiTaskDatasetLoader:
         self._partition_cache[task] = (val_pool, train_pool)
         return val_pool, train_pool
 
+    def _heldout(self, task: str) -> Optional[Tuple[str, str]]:
+        """(val, final) official splits when "val" is NOT a slice of train (v3), else None."""
+        return TASK_SPECS[task].heldout_splits if self.data_format == "v3" else None
+
+    def hf_split(self, task: str, role: str) -> str:
+        """Official split a role's rows come from."""
+        held = self._heldout(task)
+        if role == "final":
+            return held[1] if held else TASK_SPECS[task].final_split
+        if role == "val" and held:
+            return held[0]
+        return TASK_SPECS[task].train_split
+
     def _candidates(self, task: str, role: str) -> Tuple[Any, np.ndarray]:
         """(hf_dataset, candidate row indices in selection order) for a role."""
-        spec = TASK_SPECS[task]
+        ds = self._load_hf(task, self.hf_split(task, role))
         if role == "final":
-            ds = self._load_hf(task, spec.final_split)
             return ds, _task_rng(self.split_seed, task, "final").permutation(len(ds))
-        ds = self._load_hf(task, spec.train_split)
+        if self._heldout(task):  # official val split; train uses the whole train split
+            if role == "val":
+                return ds, _task_rng(self.split_seed, task, "val").permutation(len(ds))
+            return ds, _task_rng(self.seed, task, "train").permutation(len(ds))
         val_pool, train_pool = self._partition(task)
         if role == "val":
             return ds, val_pool
@@ -663,11 +690,12 @@ class MultiTaskDatasetLoader:
             "task": task,
             "sources": [[r, c] for r, c, _ in spec.sources],
             "role": role,
-            "hf_split": spec.final_split if role == "final" else spec.train_split,
+            "hf_split": self.hf_split(task, role),
             "n": self._role_n(role),
             "seed": self.seed if role == "train" else None,  # val/final use split_seed only
             "split_seed": self.split_seed,
-            "val_fraction": self.val_fraction if role != "final" else None,
+            "val_fraction": (self.val_fraction if role != "final" and not self._heldout(task)
+                             else None),
             "max_length": self.max_length,
         }
 
@@ -868,7 +896,7 @@ class MultiTaskDatasetLoader:
                                samples_per_task: Optional[int] = None,
                                num_workers: int = 0) -> DataLoader:
         """Unshuffled eval loader, task-contiguous, rows length-sorted within a task.
-        which="val": seeded train slice (checkpoint selection); "final": official split."""
+        which="val": held-out val (checkpoint selection); "final": official test split."""
         if which not in ("val", "final"):
             raise ValueError(f"which must be 'val' or 'final', got {which!r}")
         return self._eval_loader(which, batch_size, samples_per_task, num_workers)

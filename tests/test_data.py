@@ -104,3 +104,81 @@ def test_collator_supervised_positions():
     assert out["sup_rows"].tolist() == [0, 0, 1, 1]
     assert out["ans_flat"].tolist() == out["sup_flat"].tolist()  # answer_only_loss
     assert out["example_idx"].tolist() == [11, 4] and out["prompt_len"].tolist() == [3, 1]
+
+
+# --- val/train/final split construction (offline: fake HF splits) -------------------------
+
+import numpy as np  # noqa: E402
+import pytest  # noqa: E402
+
+from gated_lora.data.multi_task_dataset import MultiTaskDatasetLoader  # noqa: E402
+
+FAKE_SIZES = {"train": 400, "validation": 60, "test": 50, "validation_matched": 40}
+
+
+class _FakeSplit:
+    def __init__(self, name):
+        self.name = name
+
+    def __len__(self):
+        return FAKE_SIZES[self.name]
+
+    def __getitem__(self, column):  # group columns: 40 groups of 10 rows
+        return [f"g{i // 10}" for i in range(len(self))]
+
+
+def _loader(data_format, seed=0):
+    ld = MultiTaskDatasetLoader.__new__(MultiTaskDatasetLoader)
+    ld.__dict__.update(data_format=data_format, split_seed=0, seed=seed, val_fraction=0.05,
+                       _partition_cache={}, _hf_cache={},
+                       # read by cache_key only
+                       tokenizer=type("Tok", (), {"__len__": lambda self: 10})(),
+                       tokenizer_name="tok", bos_ids=[], eos_id=0, max_length=8,
+                       max_samples_per_task=None, max_val_samples=None, max_final_samples=None)
+    ld._load_hf = lambda task, split: _FakeSplit(split)
+    return ld
+
+
+def _rows(ld, task, role):
+    ds, idx = ld._candidates(task, role)
+    return ds.name, set(int(i) for i in idx)
+
+
+@pytest.mark.parametrize("task", ["wikitext", "conll2003", "xsum"])
+def test_v3_heldout_tasks_use_official_val_and_test(task):
+    ld = _loader("v3")
+    assert _rows(ld, task, "train") == ("train", set(range(400)))
+    assert _rows(ld, task, "val") == ("validation", set(range(60)))
+    assert _rows(ld, task, "final") == ("test", set(range(50)))
+    assert ld.cache_key(task, "val")["hf_split"] == "validation"
+    assert ld.cache_key(task, "val")["val_fraction"] is None
+
+
+@pytest.mark.parametrize("task", ["wikitext", "conll2003", "xsum", "gsm8k", "squad"])
+def test_v2_val_is_a_disjoint_train_slice(task):
+    ld = _loader("v2")
+    tr_split, tr = _rows(ld, task, "train")
+    val_split, val = _rows(ld, task, "val")
+    assert tr_split == val_split == "train"
+    assert not tr & val and len(tr | val) == 400
+    assert _rows(ld, task, "final")[0] != "train"
+
+
+@pytest.mark.parametrize("task", ["squad", "imdb", "gsm8k", "commonsenseqa", "mnli"])
+def test_v3_keeps_v2_splits_for_other_tasks(task):
+    for role in ("train", "val", "final"):
+        assert _rows(_loader("v3"), task, role) == _rows(_loader("v2"), task, role)
+
+
+def test_v2_and_v3_never_share_a_cache_entry():
+    ld2, ld3 = _loader("v2"), _loader("v3")
+    for task in ("gsm8k", "wikitext"):
+        for role in ("train", "val", "final"):
+            assert ld2.cache_key(task, role) != ld3.cache_key(task, role)
+
+
+def test_v3_train_order_depends_on_run_seed_only():
+    a, b, c = _loader("v3", seed=1), _loader("v3", seed=1), _loader("v3", seed=2)
+    ia, ib, ic = (ld._candidates("wikitext", "train")[1] for ld in (a, b, c))
+    assert np.array_equal(ia, ib) and not np.array_equal(ia, ic)
+    assert np.array_equal(a._candidates("wikitext", "val")[1], c._candidates("wikitext", "val")[1])

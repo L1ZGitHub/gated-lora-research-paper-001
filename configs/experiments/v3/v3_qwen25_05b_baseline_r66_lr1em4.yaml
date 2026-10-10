@@ -1,0 +1,19 @@
+# Phase A' LR sweep point. Plain LoRA r=66: parameter-matched to the gated model (36.3M).
+extends:
+  - models/qwen25_05b.yaml
+  - tasks/all_8.yaml
+  - base/v3.yaml
+
+experiment_name: v3_qwen25_05b_baseline_r66_lr1em4
+
+model:
+  model_type: baseline
+  lora_r: 66
+  lora_alpha: 132
+training:
+  learning_rate: 1.0e-4
+
+output:
+  output_dir: ./outputs/v3_qwen25_05b_baseline_r66_lr1em4
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: v3/qwen25_05b_baseline_r66_lr1em4

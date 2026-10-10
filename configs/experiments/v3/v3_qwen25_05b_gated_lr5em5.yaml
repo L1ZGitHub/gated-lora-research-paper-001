@@ -1,0 +1,15 @@
+# Phase A' LR sweep point. Gated mixed-rank LoRA (experts r=8/16/32, dense softmax gate per token and layer).
+extends:
+  - models/qwen25_05b.yaml
+  - tasks/all_8.yaml
+  - base/v3.yaml
+
+experiment_name: v3_qwen25_05b_gated_lr5em5
+
+training:
+  learning_rate: 5.0e-5
+
+output:
+  output_dir: ./outputs/v3_qwen25_05b_gated_lr5em5
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: v3/qwen25_05b_gated_lr5em5
