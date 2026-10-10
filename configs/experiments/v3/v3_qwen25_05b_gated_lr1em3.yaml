@@ -1,0 +1,15 @@
+# Phase A' wide-grid LR point. Gated mixed-rank LoRA (experts r=8/16/32, dense softmax gate per token and layer).
+extends:
+  - models/qwen25_05b.yaml
+  - tasks/all_8.yaml
+  - base/v3.yaml
+
+experiment_name: v3_qwen25_05b_gated_lr1em3
+
+training:
+  learning_rate: 1.0e-3
+
+output:
+  output_dir: ./outputs/v3_qwen25_05b_gated_lr1em3
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: v3/qwen25_05b_gated_lr1em3

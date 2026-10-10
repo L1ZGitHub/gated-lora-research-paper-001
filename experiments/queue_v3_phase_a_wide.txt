@@ -1,0 +1,26 @@
+# v3 Phase A' wide grid (experiments/README.md, v3 protocol amendment): 1e-6..1e-3 around the
+# 2.5e-5/5e-5/1e-4 points, every arm, seed 0.
+configs/experiments/v3/v3_qwen25_05b_gated_lr1em6.yaml 0
+configs/experiments/v3/v3_qwen25_05b_gated_lr3em6.yaml 0
+configs/experiments/v3/v3_qwen25_05b_gated_lr1em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_gated_lr2p5em4.yaml 0
+configs/experiments/v3/v3_qwen25_05b_gated_lr5em4.yaml 0
+configs/experiments/v3/v3_qwen25_05b_gated_lr1em3.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r66_lr1em6.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r66_lr3em6.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r66_lr1em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r66_lr2p5em4.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r66_lr5em4.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r66_lr1em3.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r32_lr1em6.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r32_lr3em6.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r32_lr1em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r32_lr2p5em4.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r32_lr5em4.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r32_lr1em3.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r16_lr1em6.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r16_lr3em6.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r16_lr1em5.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r16_lr2p5em4.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r16_lr5em4.yaml 0
+configs/experiments/v3/v3_qwen25_05b_baseline_r16_lr1em3.yaml 0

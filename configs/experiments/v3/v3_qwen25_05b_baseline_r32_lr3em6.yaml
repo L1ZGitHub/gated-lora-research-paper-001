@@ -1,0 +1,19 @@
+# Phase A' wide-grid LR point. Plain LoRA r=32 (17.6M): best plain LoRA on test in v2.
+extends:
+  - models/qwen25_05b.yaml
+  - tasks/all_8.yaml
+  - base/v3.yaml
+
+experiment_name: v3_qwen25_05b_baseline_r32_lr3em6
+
+model:
+  model_type: baseline
+  lora_r: 32
+  lora_alpha: 64
+training:
+  learning_rate: 3.0e-6
+
+output:
+  output_dir: ./outputs/v3_qwen25_05b_baseline_r32_lr3em6
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: v3/qwen25_05b_baseline_r32_lr3em6

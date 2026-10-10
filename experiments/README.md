@@ -96,6 +96,13 @@ argmin is at an edge of the grid, one more point beyond it (1.25e-5 or 2e-4) is 
 Phase B'. r56, frozen_gate and equal_rank use gated's LR; frozen_gate_target_top1 = the mean
 final top-1 of gated's Phase A' run at that LR.
 
+**Phase A' amendment (2026-10-10, after the 3-point results, before any wider run).** Three of the
+four argmins were at a grid edge (gated and r66 at 2.5e-5, r16 at 1e-4 by 2e-5), so instead of
+one edge point per arm the grid is widened once for every arm to {1e-6, 3e-6, 1e-5, 2.5e-5, 5e-5,
+1e-4, 2.5e-4, 5e-4, 1e-3} (`queue_v3_phase_a_wide.txt`). Each arm's LR = argmin of its full-val
+macro loss (last checkpoint) over these 9 points. The grid is not extended again: an argmin at
+1e-6 or 1e-3 is reported as such.
+
 **Phase B'.** Seeds 1-4 for gated, r66, r32, r16 at their LR (seed 0 = the Phase A' run);
 r56 seeds 0-4; frozen_gate and equal_rank seeds 0-2.
 
