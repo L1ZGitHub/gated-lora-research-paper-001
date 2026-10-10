@@ -63,8 +63,8 @@ def fig1(out: Path) -> None:
         ("Gated, last quarter only", "gated_last_quarter", range(3), False),
         ("Gated, one global gate", "global_gate", range(1), False),
         ("Frozen random gate", "frozen_gate", range(3), False),
-        ("LoRA r32", "baseline_r32", range(1), False),
-        ("LoRA r16", "baseline_r16", range(1), False),
+        ("LoRA r32", "baseline_r32", range(5), False),
+        ("LoRA r16", "baseline_r16", range(5), False),
         ("LoRA r8", "baseline_r8", range(1), False),
     ]
     vals = {}
