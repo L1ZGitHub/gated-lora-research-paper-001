@@ -197,3 +197,49 @@ and metric as above; only ranks and learning rates change.
   training and evaluation had finished (TRAINING_DONE written on the node at 19:55). The same
   31 files were committed by hand from the node's output directory, then the job was cancelled.
   No result was recomputed.
+
+**Phase D (pre-registered 2026-10-12, after the Phase B' and C' results, before any Phase D
+run): second base model.**
+
+Phase D asks whether the Qwen2.5-0.5B findings hold on another model. Same data, splits, steps,
+batch, precision, gate network, auxiliary losses and metric; only the base model changes.
+
+- *Model.* `HuggingFaceTB/SmolLM-360M` (32 layers, same seven target maps per layer). Chosen
+  before any run because it trains with the unchanged code path. A 300-step smoke test (500
+  examples per task, never pushed, not a result) confirmed that the gated and the plain model
+  train in fp16 without overflow (1.42 and 1.06 s/step).
+- *Arms.* Gated 8/16/32, gated 2/4/8, plain r56 and r14 (each gated model with routing off)
+  and plain r2. No r66/r32/r16 and no frozen-gate or equal-rank control: a stated limitation.
+- *LR grid (seed 0, `queue_v3_phase_d_grid.txt`).* {5e-6, 1e-5, 2.5e-5, 5e-5, 1e-4, 2.5e-4, 5e-4,
+  1e-3, 2.5e-3} for every arm (the union of the Qwen optima, 2.5e-5 to 2.5e-4, with at least two
+  points on each side). Each arm's LR = argmin of its full-val macro loss (last checkpoint); a
+  diverged run counts as worse than any finite one; the grid is not extended; an argmin at an
+  edge is reported as such.
+- *Seeds.* Seeds 1-4 at each arm's LR (seed 0 = the grid run), 5 per arm.
+- *Q1 tests.* Macro test loss, last checkpoint. Gated 8/16/32 vs r56; gated 2/4/8 vs r14 and vs
+  r2: Welch two-sided and TOST with the same margin delta = 0.005, Holm over the 3 comparisons.
+  Rank: r2 and r14 vs r56 (Welch, Holm over 2); "capacity-bound" needs adjusted p < 0.05 AND a
+  mean more than 0.005 above r56.
+- *Q2 analyses* on both gated models, layer blocks = thirds (layers 0-9, 10-20, 21-31): gate
+  shares per task and block, eta^2, seed-to-seed correlation of task-centred maps, expert
+  knockouts (each expert x each block and all layers), usage-damage Spearman overall and per
+  expert, removal of the two smaller experts, Spearman(task loss, expected rank). Also, now
+  specified in advance (they were post hoc on Qwen): seed-to-seed correlation of the layer x
+  expert depth profile, Spearman between the largest expert's share and the relative loss
+  reduction from fine-tuning, and per-task removal chosen on val and scored on test (both gated
+  models, r56 and r14).
+- *What counts as replicated* (each reported as replicated or not; none redefined afterwards):
+  - R1 accuracy: each gated model is equivalent to its routing-off twin (TOST, adjusted
+    p < 0.05).
+  - R2 rank: r2 is not capacity-bound relative to r56.
+  - R3 dominant expert: in both mixes, removing the largest expert from all layers raises the
+    macro test loss by at least 10 times the absolute change caused by removing either other
+    expert (means over seeds).
+  - R4 faithfulness: the usage-damage Spearman of the largest expert is positive on average
+    and in at least 12 of the 15 seed x block cases, in both mixes.
+  - R5 reproducibility: mean seed-to-seed correlation of the task-centred maps >= 0.5 in both
+    mixes (Qwen: 0.71 and 0.61; equal-rank control 0.46; random gates 0.02).
+  - R6 task ordering (2/4/8 only): Spearman(task loss, expected rank) negative in all five
+    seeds with a mean <= -0.7 (Qwen: -0.90 to -0.95). No prediction for 8/16/32.
+  - R7 removable small expert: removing the smallest expert from all layers changes the macro
+    test loss by less than 0.005 in absolute value, in both mixes.

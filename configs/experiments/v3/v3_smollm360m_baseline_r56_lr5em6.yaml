@@ -1,0 +1,19 @@
+# Phase D LR grid point (second model, SmolLM-360M). Plain LoRA r=56 (= gated 8/16/32 with routing off).
+extends:
+  - models/smollm360m.yaml
+  - tasks/all_8.yaml
+  - base/v3.yaml
+
+experiment_name: v3_smollm360m_baseline_r56_lr5em6
+
+model:
+  model_type: baseline
+  lora_r: 56
+  lora_alpha: 112
+training:
+  learning_rate: 5.0e-6
+
+output:
+  output_dir: ./outputs/v3_smollm360m_baseline_r56_lr5em6
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: v3/smollm360m_baseline_r56_lr5em6

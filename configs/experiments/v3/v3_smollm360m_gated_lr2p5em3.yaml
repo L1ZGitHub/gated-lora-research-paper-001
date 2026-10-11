@@ -1,0 +1,15 @@
+# Phase D LR grid point (second model, SmolLM-360M). Gated mixed-rank LoRA, experts r=8/16/32.
+extends:
+  - models/smollm360m.yaml
+  - tasks/all_8.yaml
+  - base/v3.yaml
+
+experiment_name: v3_smollm360m_gated_lr2p5em3
+
+training:
+  learning_rate: 2.5e-3
+
+output:
+  output_dir: ./outputs/v3_smollm360m_gated_lr2p5em3
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: v3/smollm360m_gated_lr2p5em3
