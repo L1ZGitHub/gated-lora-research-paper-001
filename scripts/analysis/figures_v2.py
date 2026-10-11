@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Paper figures for the v2 Qwen2.5-0.5B experiments (PDF + PNG), from the small HF result files
-and the knockout outputs of knockout_v2.py. Light mode only (print). Colours: the dataviz
-reference palette (categorical slot 1 blue for the gated arm, a neutral for context arms;
-sequential blue ramp; diverging blue <-> red around a gray midpoint).
+"""Paper figures for the v2 or v3 Qwen2.5-0.5B experiments (--version; PDF + PNG), from the small
+HF result files and the knockout outputs of knockout_v2.py. Light mode only (print). Colours:
+the dataviz reference palette (categorical slot 1 blue for the gated arm, a neutral for context
+arms; sequential blue ramp; diverging blue <-> red around a gray midpoint).
 
-    .venv/bin/python scripts/analysis/figures_v2.py --ko-dir ~/GatedLoraProject/ko_results --out figures
+    .venv/bin/python scripts/analysis/figures_v2.py [--version v2] [--gates-dir DIR] \
+        --ko-dir ~/GatedLoraProject/ko_results --out figures
 
 fig1_q1_losses   val and test answer loss per arm (seeds + mean +- sd), incl. the rank curve
 fig2_routing     gate share per task x layer for the rank-8 / 16 / 32 experts (5 seeds)
@@ -27,7 +28,35 @@ from matplotlib.colors import LinearSegmentedColormap, SymLogNorm  # noqa: E402
 from huggingface_hub import hf_hub_download  # noqa: E402
 
 REPO = "Helain/gated-lora-experiments"
-P = "v2_qwen25_05b_"
+P = "v2_qwen25_05b_"  # set by --version
+FIG1_ARMS = {  # version -> [(label, config, seeds, emphasised)]; the first entry is the gated arm
+    "v2": [
+        ("Gated 8/16/32", "gated_lr5em5", range(5), True),
+        ("LoRA r66 (param-matched)", "baseline_r66_lr5em5", range(5), False),
+        ("LoRA r56 (= routing off)", "baseline_r56", range(5), False),
+        ("Gated, equal ranks 19/19/18", "equal_rank", range(3), False),
+        ("Gated, last quarter only", "gated_last_quarter", range(3), False),
+        ("Gated, one global gate", "global_gate", range(1), False),
+        ("Frozen random gate", "frozen_gate", range(3), False),
+        ("LoRA r32", "baseline_r32", range(5), False),
+        ("LoRA r16", "baseline_r16", range(5), False),
+        ("LoRA r8", "baseline_r8", range(1), False),
+    ],
+    "v3": [
+        ("Gated 8/16/32", "gated_lr2p5em5", range(5), True),
+        ("LoRA r66 (param-matched)", "baseline_r66_lr2p5em5", range(5), False),
+        ("LoRA r56 (= routing off)", "baseline_r56", range(5), False),
+        ("LoRA r32", "baseline_r32_lr5em5", range(5), False),
+        ("LoRA r16", "baseline_r16_lr1em4", range(5), False),
+        ("Gated, equal ranks 19/19/18", "equal_rank", range(3), False),
+        ("Frozen random gate", "frozen_gate", range(3), False),
+    ],
+}
+FIG1_NOTE = {"v2": "LR 5e-5 for every arm.",
+             "v3": "LR per arm from the Phase A' grid (gated, r66, r56 and controls 2.5e-5; "
+                   "r32 5e-5; r16 1e-4)."}
+VERSION = "v2"
+GATES_DIR = None  # --gates-dir: re-dumped per-example files (knockout_v2.py --dump-dir)
 INK, INK2, GRID, SURF = "#0b0b0b", "#52514e", "#e4e3df", "#ffffff"
 BLUE, NEUTRAL = "#2a78d6", "#6e6d69"
 SEQ = ["#f4f8fd", "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7", "#3987e5",
@@ -55,18 +84,7 @@ def save(fig, out: Path, name: str) -> None:
 
 
 def fig1(out: Path) -> None:
-    arms = [  # label, config, seeds, emphasised
-        ("Gated 8/16/32", "gated_lr5em5", range(5), True),
-        ("LoRA r66 (param-matched)", "baseline_r66_lr5em5", range(5), False),
-        ("LoRA r56 (= routing off)", "baseline_r56", range(5), False),
-        ("Gated, equal ranks 19/19/18", "equal_rank", range(3), False),
-        ("Gated, last quarter only", "gated_last_quarter", range(3), False),
-        ("Gated, one global gate", "global_gate", range(1), False),
-        ("Frozen random gate", "frozen_gate", range(3), False),
-        ("LoRA r32", "baseline_r32", range(5), False),
-        ("LoRA r16", "baseline_r16", range(5), False),
-        ("LoRA r8", "baseline_r8", range(1), False),
-    ]
+    arms = FIG1_ARMS[VERSION]
     vals = {}
     for label, cfg, seeds, _ in arms:
         ev = [json.load(open(get(f"{cfg}_seed{s}", "eval_results.json"))) for s in seeds]
@@ -100,14 +118,18 @@ def fig1(out: Path) -> None:
     for t, a in zip(axes[0].get_yticklabels(), arms):
         t.set_color(INK if a[3] else INK2)
     fig.text(0.0, -0.10, "Hollow circles: seeds. Filled: mean ± 1 s.d. Diamond: single seed. "
-             "Dashed line: gated mean. LR 5e-5 for every arm.", color=INK2, fontsize=7)
+             f"Dashed line: gated mean. {FIG1_NOTE[VERSION]}", color=INK2, fontsize=7)
     save(fig, out, "fig1_q1_losses")
 
 
 def routing_shares() -> tuple[list[str], np.ndarray]:
     maps = []
     for s in range(5):
-        z = np.load(get(f"gated_lr5em5_seed{s}", "final_examples.npz"))
+        run = f"{FIG1_ARMS[VERSION][0][1]}_seed{s}"
+        z = np.load(f"{GATES_DIR}/{P}{run}_final_examples.npz" if GATES_DIR
+                    else get(run, "final_examples.npz"))
+        if VERSION != "v2" and "gate_positions" not in z:
+            raise SystemExit(f"{run}: old gate positions; pass --gates-dir (knockout_v2.py --dump-dir)")
         g, t = z["gate_answer"].astype(np.float32), z["task"]
         maps.append(np.stack([g[t == k].mean(0) for k in TASK_ORDER]))  # [T, L, E]
     return TASK_ORDER, np.mean(maps, 0)
@@ -139,7 +161,9 @@ def fig2(out: Path) -> None:
 
 
 def fig3(out: Path, ko_dir: str) -> None:
-    ko = [json.load(open(os.path.join(ko_dir, f"gated_lr5em5_seed{s}.json"))) for s in range(5)]
+    gated = FIG1_ARMS[VERSION][0][1]
+    name = (lambda s: f"{gated}_seed{s}.json") if VERSION == "v2" else (lambda s: f"{P}{gated}_seed{s}.json")
+    ko = [json.load(open(os.path.join(ko_dir, name(s)))) for s in range(5)]
     cols = [(e, b) for e in range(3) for b in ("early", "mid", "late", "all")]
     d = np.array([[np.mean([k["conditions"][f"ko{e}_{b}"]["per_task"][t]
                             - k["conditions"]["none"]["per_task"][t] for k in ko])
@@ -174,9 +198,13 @@ def fig3(out: Path, ko_dir: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--version", choices=sorted(FIG1_ARMS), default="v3")
+    ap.add_argument("--gates-dir", default=None, help="re-dumped per-example files (v3 fig2)")
     ap.add_argument("--ko-dir", required=True)
     ap.add_argument("--out", default="figures")
     args = ap.parse_args()
+    global VERSION, P, GATES_DIR
+    VERSION, P, GATES_DIR = args.version, f"{args.version}_qwen25_05b_", args.gates_dir
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     fig1(out)

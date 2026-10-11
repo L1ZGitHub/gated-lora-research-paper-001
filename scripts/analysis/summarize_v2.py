@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Summarise v2 runs on the HF dataset repo: status, val/final macro answer loss, generation
-metrics, trained-gate top-1 sharpness, test loss on the val-selected checkpoint (final*);
-and the Phase A decisions (LR per arm, frozen-gate target). Reads only small files (eval_results.json, final_examples.npz); no model.
+"""Summarise v2 or v3 runs (--version) on the HF dataset repo: status, val/final macro answer
+loss, generation metrics, trained-gate top-1 sharpness, test loss on the val-selected checkpoint
+(final*); and the Phase A decisions (LR per arm, frozen-gate target). Reads only small files (eval_results.json, final_examples.npz); no model.
 
-    .venv/bin/python scripts/analysis/summarize_v2.py [--prefix v2_qwen25_05b] [--json out.json]
+    .venv/bin/python scripts/analysis/summarize_v2.py [--version v2] [--json out.json]
 """
 
 from __future__ import annotations
@@ -17,7 +17,11 @@ import numpy as np
 from huggingface_hub import HfApi, hf_hub_download
 
 REPO = "Helain/gated-lora-experiments"
-LR_SWEEPS = {  # arm -> {lr: config basename}
+V3_LRS = {1e-6: "1em6", 3e-6: "3em6", 1e-5: "1em5", 2.5e-5: "2p5em5", 5e-5: "5em5", 1e-4: "1em4",
+          2.5e-4: "2p5em4", 5e-4: "5em4", 1e-3: "1em3"}  # v3 Phase A' grid
+V3_LR_SWEEPS = {arm: {lr: f"v3_qwen25_05b_{arm}_lr{tag}" for lr, tag in V3_LRS.items()}
+                for arm in ("gated", "baseline_r66", "baseline_r32", "baseline_r16")}
+LR_SWEEPS = {  # v2: arm -> {lr: config basename}
     "gated": {2.5e-5: "v2_qwen25_05b_gated_lr2p5em5", 5e-5: "v2_qwen25_05b_gated_lr5em5", 1e-4: "v2_qwen25_05b_gated_lr1em4", 2e-4: "v2_qwen25_05b_gated",
               4e-4: "v2_qwen25_05b_gated_lr4em4"},
     "baseline_r66": {2.5e-5: "v2_qwen25_05b_baseline_r66_lr2p5em5",
@@ -28,14 +32,15 @@ LR_SWEEPS = {  # arm -> {lr: config basename}
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--prefix", default="v2_")
+    ap.add_argument("--version", choices=["v2", "v3"], default="v3")
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
+    prefix, sweeps = f"{args.version}_", (V3_LR_SWEEPS if args.version == "v3" else LR_SWEEPS)
 
     files = HfApi().list_repo_files(REPO, repo_type="dataset")
     runs = defaultdict(set)
     for f in files:
-        m = re.match(rf"({re.escape(args.prefix)}[^/]*_seed\d+)/(.+)$", f)
+        m = re.match(rf"({re.escape(prefix)}[^/]*_seed\d+)/(.+)$", f)
         if m:
             runs[m.group(1)].add(m.group(2))
 
@@ -77,12 +82,13 @@ def main() -> None:
               f"{str(r.get('best_step', '')):>5s} {fmt(r.get('final_loss_best'))}")
 
     # Phase A decisions: LR per arm on mean val loss over the seeds that finished
+    # (v3: seed 0 only, as pre-registered; Phase B' seeds 1-4 must not move the choice)
     by_cfg = defaultdict(list)
     for r in rows:
-        if r["done"] and "val_loss" in r:
+        if r["done"] and "val_loss" in r and (args.version == "v2" or r["seed"] == 0):
             by_cfg[r["config"]].append(r)
     decisions = {}
-    for arm, sweep in LR_SWEEPS.items():
+    for arm, sweep in sweeps.items():
         scores = {lr: float(np.mean([x["val_loss"] for x in by_cfg[c]]))
                   for lr, c in sweep.items() if by_cfg.get(c)}
         n = {lr: len(by_cfg.get(c, [])) for lr, c in sweep.items()}
@@ -91,7 +97,7 @@ def main() -> None:
             decisions[arm] = {"val_loss_by_lr": scores, "seeds_by_lr": n, "best_lr": best}
             print(f"\n{arm}: val loss by LR {scores} (seeds {n}) -> best LR {best:g}")
     if "gated" in decisions:  # sharpness of the trained gates at the chosen LR
-        cfg = LR_SWEEPS["gated"][decisions["gated"]["best_lr"]]
+        cfg = sweeps["gated"][decisions["gated"]["best_lr"]]
         gated_top1 = [r["top1"] for r in by_cfg.get(cfg, []) if "top1" in r]
         if gated_top1:
             decisions["frozen_gate_target_top1"] = float(np.mean(gated_top1))

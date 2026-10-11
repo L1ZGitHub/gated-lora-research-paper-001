@@ -114,3 +114,31 @@ reported as no detectable difference (with the CI), never as a win.
 **Q2 analyses** (unchanged from v2, fixed in advance): eta^2 of routing by task per depth
 block, map correlation across seeds vs frozen_gate/equal_rank, expert knockout on test with
 usage-damage Spearman, per-task expert removal chosen on val and scored on test.
+
+**Amendment (2026-10-11, after the Phase A' grid, while Phase B' trains, before any Phase B'
+result is looked at).** From a code review of the pipeline:
+
+- *Q1 equivalence.* A non-significant Welch test is not evidence of "as good as". Added, per
+  comparison: TOST with margin delta = 0.005 nats (macro test loss; ~3 seed s.d. in v2, 0.25%
+  of the fine-tuning gain 2.80 -> 0.78), i.e. two one-sided Welch tests, p_TOST = the larger
+  of the two; Holm over the 4 comparisons, separately from the superiority test. Verdicts:
+  "gated better" (superiority, as above), "equivalent within 0.005" (Holm-adjusted p_TOST <
+  0.05, i.e. the 90% CI of gated - X inside +-0.005), otherwise "inconclusive". The 95% CIs
+  reported are unadjusted. Inference is over training seeds; the test subset is fixed.
+- *Routing measured at the predicting positions.* `final_examples.npz` averaged gate weights
+  over the answer-token positions themselves (incl. the EOS position, which predicts nothing),
+  not over the positions that predict answer tokens (`answer_mask[:, 1:]`). Fixed in the
+  trainer; every routing-bearing run used by Q2 (gated, equal_rank, frozen_gate, all seeds) is
+  re-evaluated on test from its saved final model with the fixed code
+  (`knockout_v2.py --conditions none --dump-dir`), so all Q2 numbers use one definition.
+- *Map reproducibility.* The correlation of flattened task x layer E[rank] maps is inflated by
+  any depth profile shared across seeds, and for equal_rank (19/19/18) E[rank] = 19 - w_3
+  tracks one arbitrarily labelled expert. Replaced by: per layer, the task x expert gate-share
+  map centred over tasks; for equal_rank the experts of each layer are matched across the two
+  seeds by the permutation that maximises that layer's correlation (conservative: it can only
+  help the control); identity for mixed ranks, whose experts are identified by their rank;
+  then the correlation over the concatenated layers; mean over seed pairs.
+- *Frozen gate.* Its target 0.723 was measured on test inputs (no labels) of gated's seed-0
+  run; the achieved final top-1 of each frozen_gate run is reported next to it.
+- *Checkpoint selection* (secondary metric only) uses the first 250 val examples per task
+  every 1000 steps, not the full val set.

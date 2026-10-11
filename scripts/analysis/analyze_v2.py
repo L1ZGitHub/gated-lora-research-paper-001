@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""v2 Qwen2.5-0.5B analyses from the small HF result files (no model, no GPU).
+"""Qwen2.5-0.5B analyses of v2 or v3 runs (--version) from the small HF result files (no model,
+no GPU).
+
+  q1:        pre-registered Q1 test (experiments/README.md, v3): per-seed macro test loss (last
+             checkpoint), gated vs each plain LoRA, Welch t-test with Holm correction, 95% CIs;
+             plus the robustness metric (loss / base-model loss, v3_base_reference.json)
 
   breakdown: per-task answer loss on val (in-distribution held-out) vs test (official splits),
              gated minus r66 / r56, mean over seeds: which tasks carry the val gain, and
@@ -15,7 +20,7 @@
                layer, trained gates vs the frozen random gate control
              - reproducibility: correlation of the task x layer maps between seeds
 
-    .venv/bin/python scripts/analysis/analyze_v2.py [--out analysis_v2.json]
+    .venv/bin/python scripts/analysis/analyze_v2.py [--version v2] [--gates-dir DIR] [--out FILE]
 """
 
 from __future__ import annotations
@@ -28,20 +33,48 @@ import numpy as np
 from huggingface_hub import hf_hub_download
 
 REPO = "Helain/gated-lora-experiments"
-P = "v2_qwen25_05b_"
 SEEDS5 = range(5)
-ARMS = {  # arm -> (config, seeds, expert ranks or None)
-    "gated": ("gated_lr5em5", SEEDS5, (8, 16, 32)),
-    "r66": ("baseline_r66_lr5em5", SEEDS5, None),
-    "r56": ("baseline_r56", SEEDS5, None),
-    "equal_rank": ("equal_rank", range(3), (19, 19, 18)),
-    "last_quarter": ("gated_last_quarter", range(3), (8, 16, 32)),
-    "frozen_gate": ("frozen_gate", range(3), (8, 16, 32)),
+VERSIONS = {  # version -> arm -> (config, seeds, expert ranks or None)
+    "v2": {
+        "gated": ("gated_lr5em5", SEEDS5, (8, 16, 32)),
+        "r66": ("baseline_r66_lr5em5", SEEDS5, None),
+        "r56": ("baseline_r56", SEEDS5, None),
+        "r32": ("baseline_r32", SEEDS5, None),
+        "r16": ("baseline_r16", SEEDS5, None),
+        "equal_rank": ("equal_rank", range(3), (19, 19, 18)),
+        "last_quarter": ("gated_last_quarter", range(3), (8, 16, 32)),
+        "frozen_gate": ("frozen_gate", range(3), (8, 16, 32)),
+    },
+    "v3": {  # LR per arm from the 9-point Phase A' grid
+        "gated": ("gated_lr2p5em5", SEEDS5, (8, 16, 32)),
+        "r66": ("baseline_r66_lr2p5em5", SEEDS5, None),
+        "r56": ("baseline_r56", SEEDS5, None),
+        "r32": ("baseline_r32_lr5em5", SEEDS5, None),
+        "r16": ("baseline_r16_lr1em4", SEEDS5, None),
+        "equal_rank": ("equal_rank", range(3), (19, 19, 18)),
+        "frozen_gate": ("frozen_gate", range(3), (8, 16, 32)),
+    },
 }
+DELTA = 0.005  # Q1 equivalence margin (macro test loss, nats; README v3 amendment)
+P, ARMS = "v3_qwen25_05b_", VERSIONS["v3"]  # set by --version
+GATES_DIR = None  # --gates-dir: re-dumped per-example files (knockout_v2.py --dump-dir)
 
 
 def get(run: str, name: str) -> str:
     return hf_hub_download(REPO, f"{P}{run}/{name}", repo_type="dataset")
+
+
+def examples(run: str):
+    """Per-example test dump of a run. v3 requires the re-dumped files (gate means at the
+    positions predicting answer tokens); the training-time final_examples.npz of v2 and early v3
+    runs averaged the answer tokens themselves (one position late)."""
+    if GATES_DIR:
+        return np.load(f"{GATES_DIR}/{P}{run}_final_examples.npz")
+    z = np.load(get(run, "final_examples.npz"))
+    if "gate_positions" not in z and not P.startswith("v2_"):
+        raise SystemExit(f"{run}: final_examples.npz has the old gate positions; re-dump with "
+                         "knockout_v2.py --conditions none --dump-dir DIR and pass --gates-dir DIR")
+    return z
 
 
 def spearman(a, b) -> float:
@@ -80,15 +113,92 @@ def breakdown() -> dict:
     return out
 
 
+def holm(p: dict) -> dict:
+    """Holm step-down adjusted p-values (monotone, capped at 1)."""
+    adj, run_max = {}, 0.0
+    for i, k in enumerate(sorted(p, key=p.get)):
+        run_max = max(run_max, min(1.0, (len(p) - i) * p[k]))
+        adj[k] = run_max
+    return adj
+
+
+def q1(base_ref: str | None) -> dict:
+    """Pre-registered Q1 test: per-seed macro test loss (plain mean over tasks, last checkpoint),
+    gated vs each plain LoRA arm; Welch t-test, two-sided, Holm over the comparisons. "Better"
+    needs Holm-adjusted p < 0.05 and a lower mean. Equivalence (amendment 2026-10-11): TOST with
+    margin DELTA, Holm over the comparisons. Robustness: superiority on loss / base loss."""
+    from scipy import stats  # installed with scikit-learn
+
+    per = {arm: [json.load(open(get(f"{cfg}_seed{s}", "eval_results.json")))["final"]["per_task"]
+                 for s in seeds] for arm, (cfg, seeds, _) in ARMS.items()}
+    others = [b for b in ("r66", "r56", "r32", "r16") if b in per]
+    tasks = sorted(per["gated"][0])
+    print("\n== Per-task test answer loss (last checkpoint), mean +- sd over seeds")
+    print(f"{'arm':12s}" + "".join(f"{t[:11]:>16s}" for t in tasks))
+    for a, rows in per.items():
+        v = np.array([[pt[t]["answer_loss"] for t in tasks] for pt in rows])
+        sd = v.std(0, ddof=1) if len(v) > 1 else np.full(len(tasks), np.nan)
+        print(f"{a:12s}" + "".join(f"{m:9.4f}+-{e:.4f}"[-16:].rjust(16) for m, e in zip(v.mean(0), sd, strict=True)))
+    out = {"tasks": tasks, "per_task": {a: [[pt[t]["answer_loss"] for t in tasks] for pt in rows]
+                                        for a, rows in per.items()}}
+    metrics = [("raw", lambda t: 1.0)]
+    if base_ref:
+        base = json.load(open(base_ref))["final"]
+        metrics.append(("rel_to_base", lambda t: 1.0 / base[t]))
+    for metric, w in metrics:
+        macro = {a: np.array([np.mean([m["answer_loss"] * w(t) for t, m in pt.items()]) for pt in rows])
+                 for a, rows in per.items()}
+        g = macro["gated"]
+        res = {}
+        for b in others:
+            x = macro[b]
+            d = g.mean() - x.mean()
+            vg, vx = g.var(ddof=1) / len(g), x.var(ddof=1) / len(x)
+            df = (vg + vx) ** 2 / (vg ** 2 / (len(g) - 1) + vx ** 2 / (len(x) - 1))
+            half = stats.t.ppf(0.975, df) * np.sqrt(vg + vx)
+            se = np.sqrt(vg + vx)
+            half90 = stats.t.ppf(0.95, df) * se
+            # the margin is defined on the primary (raw) metric only
+            p_tost = (max(stats.t.sf((d + DELTA) / se, df), stats.t.cdf((d - DELTA) / se, df))
+                      if metric == "raw" else float("nan"))
+            res[b] = {"diff": float(d), "ci95": [float(d - half), float(d + half)],
+                      "ci90": [float(d - half90), float(d + half90)], "df": float(df),
+                      "p": float(stats.ttest_ind(g, x, equal_var=False).pvalue),
+                      "p_tost": float(p_tost),
+                      "mean": float(x.mean()), "sd": float(x.std(ddof=1)), "n": len(x)}
+        p_holm = holm({b: res[b]["p"] for b in res})
+        p_tost_holm = (holm({b: res[b]["p_tost"] for b in res}) if metric == "raw"
+                       else {b: float("nan") for b in res})
+        for b in res:
+            res[b]["p_holm"], res[b]["p_tost_holm"] = p_holm[b], p_tost_holm[b]
+            sup = ("gated better" if p_holm[b] < 0.05 and res[b]["diff"] < 0 else
+                   "gated worse" if p_holm[b] < 0.05 else "")
+            eq = f"equivalent within {DELTA}" if p_tost_holm[b] < 0.05 else ""
+            res[b]["verdict"] = "; ".join(v for v in (sup, eq) if v) or "inconclusive"
+        out[metric] = {"gated": {"mean": float(g.mean()), "sd": float(g.std(ddof=1)), "n": len(g)},
+                       "vs": res, "per_seed": {a: v.tolist() for a, v in macro.items()}}
+        print(f"\n== Q1 ({metric}{', primary' if metric == 'raw' else ', robustness'}): "
+              f"macro test loss, gated {g.mean():.4f} +- {g.std(ddof=1):.4f} (n={len(g)})")
+        print(f"  {'vs':5s} {'mean':>8s} {'sd':>7s} {'gated-x':>9s} {'95% CI (unadj.)':>21s} "
+              f"{'p':>6s} {'p_holm':>6s} {'90% CI':>21s} {'p_TOST':>6s} {'holm':>6s}  verdict")
+        for b in others:
+            r = res[b]
+            print(f"  {b:5s} {r['mean']:8.4f} {r['sd']:7.4f} {r['diff']:+9.4f} "
+                  f"[{r['ci95'][0]:+.4f}, {r['ci95'][1]:+.4f}] {r['p']:6.3f} {r['p_holm']:6.3f} "
+                  f"[{r['ci90'][0]:+.4f}, {r['ci90'][1]:+.4f}] {r['p_tost']:6.3f} "
+                  f"{r['p_tost_holm']:6.3f}  {r['verdict']}")
+    return out
+
+
 def routing() -> dict:
     out = {}
     for arm, (cfg, seeds, ranks) in ARMS.items():
         if ranks is None:
             continue
         r = np.asarray(ranks, float)
-        maps, eta_l, etav_l, rho_task, rho_ex = [], [], [], [], []
+        maps, shares, eta_l, etav_l, rho_task, rho_ex = [], [], [], [], [], []
         for s in seeds:
-            z = np.load(get(f"{cfg}_seed{s}", "final_examples.npz"))
+            z = examples(f"{cfg}_seed{s}")
             g = z["gate_answer"].astype(np.float32)  # [N, L, E]
             g = g[:, np.isfinite(g).any(axis=(0, 2))]  # gated layers only (last_quarter: 6)
             task = z["task"]
@@ -105,6 +215,8 @@ def routing() -> dict:
             er = (g * r).sum(-1)  # expected rank [N, L]
             m = np.stack([er[ok & (task == t)].mean(0) for t in tasks])  # [T, L]
             maps.append(m)
+            sh = np.stack([g[ok & (task == t)].mean(0) for t in tasks])  # [T, L, E] gate share
+            shares.append(sh - sh.mean(0))  # centred over tasks: shared depth profile removed
             # eta^2 per layer: between-task variance of E[r] / total variance
             tot = er[ok].var(0)
             between = sum((ok & (task == t)).sum() * (er[ok & (task == t)].mean(0) - er[ok].mean(0)) ** 2
@@ -115,7 +227,18 @@ def routing() -> dict:
             rho_ex.append(np.mean([spearman(nll[ok & (task == t)], er[ok & (task == t)].mean(1))
                                    for t in tasks]))
         maps = np.stack(maps)  # [S, T, L]
-        rep = [float(np.corrcoef(a.ravel(), b.ravel())[0, 1]) for a, b in itertools.combinations(maps, 2)]
+        # reproducibility (amendment 2026-10-11): task-centred gate-share maps; experts of equal
+        # rank have no identity, so each layer's experts are matched across the two seeds by the
+        # best permutation (conservative: only helps that control); mixed ranks: identity
+        n_exp = len(ranks)
+        perms = (list(itertools.permutations(range(n_exp))) if len(set(ranks)) < n_exp
+                 else [tuple(range(n_exp))])
+        rep = []
+        for a, b in itertools.combinations(shares, 2):
+            bm = np.stack([max((b[:, li][:, list(pm)] for pm in perms),
+                               key=lambda x, li=li: np.corrcoef(a[:, li].ravel(), x.ravel())[0, 1])
+                           for li in range(a.shape[1])], axis=1)
+            rep.append(float(np.corrcoef(a.ravel(), bm.ravel())[0, 1]))
         eta = np.nanmean(np.stack(eta_l), 0)
         etav = np.mean(np.stack(etav_l), 0)
         L = maps.shape[2]
@@ -131,7 +254,8 @@ def routing() -> dict:
               + f"  (max {np.nanmax(eta):.2f} at layer {int(np.nanargmax(eta))})")
         print(f"  task specificity of the whole gate vector (permutation-invariant), "
               f"layers early/mid/late: " + " / ".join(f"{etav[s].mean():.2f}" for s in thirds))
-        print(f"  map reproducibility across seeds (corr of task x layer E[rank]): "
+        print(f"  map reproducibility across seeds (corr of task-centred task x layer x expert "
+              f"gate shares{', experts matched per layer' if len(perms) > 1 else ''}): "
               f"mean {np.mean(rep):.2f} (min {np.min(rep):.2f})")
         print(f"  harder task -> bigger rank? Spearman(task loss, E[rank]) per seed: "
               + " ".join(f"{x:+.2f}" for x in rho_task))
@@ -152,8 +276,10 @@ def knockout(ko_dir: str) -> dict:
     out = {}
     for f in sorted(glob.glob(os.path.join(ko_dir, "*.json"))):
         k = json.load(open(f))
+        if k.get("split", "final") != "final" or k.get("version", "v2") != P[:2]:
+            continue  # val-split files are for pertask(); other versions never mix in
         run = k["run"]
-        z = np.load(get(run, "final_examples.npz"))
+        z = examples(run)
         g, task = z["gate_answer"].astype(np.float32), z["task"]
         ok = np.isfinite(g).all(axis=(1, 2)) & (z["answer_tokens"] > 0)
         base = k["conditions"]["none"]["per_task"]
@@ -193,7 +319,7 @@ def pertask(ko_dir: str) -> dict:
     import glob
     import os
     base = {}
-    for b, (cfg, seeds, _) in (("r66", ARMS["r66"]), ("r56", ARMS["r56"])):
+    for b, (cfg, seeds, _) in ((b, ARMS[b]) for b in ("r66", "r56", "r32", "r16") if b in ARMS):
         base[b] = np.mean([json.load(open(get(f"{cfg}_seed{x}", "eval_results.json")))["final"]
                            ["mean_task_answer_loss"] for x in seeds])
     out = {}
@@ -213,7 +339,7 @@ def pertask(ko_dir: str) -> dict:
     print(f"\n== Per-task removal chosen on val, scored on test ({arm}, {len(runs)} seeds)")
     print(f"  test macro loss: intact {np.mean([out[r]['intact'] for r in runs]):.4f} | "
           f"val-chosen per task {np.mean([out[r]['per_task_policy'] for r in runs]):.4f} | "
-          f"r66 {base['r66']:.4f} | r56 {base['r56']:.4f}")
+          + " | ".join(f"{b} {v:.4f}" for b, v in base.items()))
     print("  same removal for every task (test macro, mean over seeds):")
     for c in out[runs[0]]["uniform"]:
         print(f"    {c:12s} {np.mean([out[r]['uniform'][c] for r in runs]):.4f}")
@@ -228,19 +354,35 @@ def pertask(ko_dir: str) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="analysis_v2.json")
+    ap.add_argument("--version", choices=sorted(VERSIONS), default="v3")
+    ap.add_argument("--out", default=None, help="default analysis_<version>.json")
+    ap.add_argument("--base-ref", default=None,
+                    help="base-model loss per task (scripts/analysis/base_reference.py); "
+                         "default experiments/v3_base_reference.json for v3, none for v2")
+    ap.add_argument("--gates-dir", default=None,
+                    help="re-dumped per-example files (knockout_v2.py --dump-dir); required "
+                         "for v3 routing/knockout analyses")
+    ap.add_argument("--q1-only", action="store_true")
     ap.add_argument("--routing-only", action="store_true")
     ap.add_argument("--knockout", metavar="DIR", help="only the knockout faithfulness analysis")
     ap.add_argument("--pertask", metavar="DIR", help="only the per-task removal policy analysis")
     args = ap.parse_args()
-    if args.pertask:
+    global P, ARMS, GATES_DIR
+    P, ARMS = f"{args.version}_qwen25_05b_", VERSIONS[args.version]
+    GATES_DIR = args.gates_dir
+    if args.base_ref is None and args.version == "v3":
+        args.base_ref = "experiments/v3_base_reference.json"
+    args.out = args.out or f"analysis_{args.version}.json"
+    if args.q1_only:
+        res = {"q1": q1(args.base_ref)}
+    elif args.pertask:
         res = {"pertask": pertask(args.pertask)}
     elif args.knockout:
         res = {"knockout": knockout(args.knockout)}
     elif args.routing_only:
         res = {"routing": routing()}
     else:
-        res = {"breakdown": breakdown(), "routing": routing()}
+        res = {"q1": q1(args.base_ref), "breakdown": breakdown(), "routing": routing()}
     with open(args.out, "w") as f:
         json.dump(res, f, indent=1)
     print(f"\nsaved {args.out}")
