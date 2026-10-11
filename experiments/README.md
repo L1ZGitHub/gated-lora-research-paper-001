@@ -176,3 +176,24 @@ and metric as above; only ranks and learning rates change.
 - *Code.* Phase C' trains with the trainer of commit 00782ed; that fix changed the routing dump
   only, not training, so Phase B' and Phase C' runs are comparable and Phase C' dumps need no
   re-evaluation.
+- *LR decision (2026-10-11, grid complete, 45 runs).* Full-val macro loss, seed 0:
+
+  | LR | r2 | r4 | r8 | r14 | gated 2/4/8 |
+  |---|---|---|---|---|---|
+  | 1e-5 | 0.8298 | 0.8187 | 0.8074 | 0.7985 | 0.7909 |
+  | 2.5e-5 | 0.8050 | 0.7958 | 0.7871 | 0.7815 | 0.7773 |
+  | 5e-5 | 0.7898 | 0.7834 | 0.7775 | 0.7741 | 0.7738 |
+  | 1e-4 | 0.7802 | 0.7758 | **0.7728** | **0.7725** | **0.7734** |
+  | 2.5e-4 | **0.7756** | **0.7726** | 0.7774 | 0.7816 | 0.7809 |
+  | 5e-4 | 0.7771 | 0.7783 | 0.7857 | 0.7922 | 0.7851 |
+  | 1e-3 | 0.7840 | 0.7953 | 0.8035 | 0.8283 | 0.7870 |
+  | 2.5e-3 | 0.8019 | 0.8257 | 0.9747 | diverged | diverged |
+  | 5e-3 | diverged | diverged | diverged | diverged | diverged |
+
+  Chosen: r2 2.5e-4, r4 2.5e-4, r8 1e-4, r14 1e-4, gated 2/4/8 1e-4; no argmin at a grid edge.
+  The 7 diverged runs stopped on a non-finite loss (fp16) and are not retried. Seeds 1-4:
+  `queue_v3_phase_c_seeds.txt`.
+- *Incident.* The final Hub commit of `gated_r2r4r8_lr1em4_seed0` hung on a dead connection after
+  training and evaluation had finished (TRAINING_DONE written on the node at 19:55). The same
+  31 files were committed by hand from the node's output directory, then the job was cancelled.
+  No result was recomputed.
