@@ -1042,12 +1042,16 @@ class GatedLoRATrainer:
             a[1] += n
 
     def _row_gate_means(self, outputs: Any, batch: Dict[str, Any]):
-        """Per row: mean gate weights per layer over prompt tokens and over answer tokens
-        ([B, L, E] each, NaN for layers without learned routing)."""
+        """Per row: mean gate weights per layer over the positions that PREDICT answer tokens
+        (answer_mask is not shifted: position t predicts token t+1) and over the positions that
+        read and predict prompt tokens ([B, L, E] each, NaN for layers without learned
+        routing). The last answer position (EOS) predicts nothing and is in neither."""
         pli = (_out(outputs, "routing_info") or {}).get("per_layer_info", {})
         am = self._to_device(batch["attention_mask"]).float()
         ans = self._to_device(batch["answer_mask"]).float() * am
-        prm = am - ans
+        pred = torch.zeros_like(ans)
+        pred[:, :-1] = ans[:, 1:]
+        prm = am * (1 - pred) * (1 - ans)
         L, E = self.model.num_layers, self.model.num_experts
         B = am.size(0)
         gp = torch.full((B, L, E), float("nan"), device=am.device)
@@ -1059,7 +1063,7 @@ class GatedLoRATrainer:
             gw = gw.float()
             l = int(layer_key)
             gp[:, l] = (gw * prm.unsqueeze(-1)).sum(1) / prm.sum(1, keepdim=True).clamp(min=1)
-            ga[:, l] = (gw * ans.unsqueeze(-1)).sum(1) / ans.sum(1, keepdim=True).clamp(min=1)
+            ga[:, l] = (gw * pred.unsqueeze(-1)).sum(1) / pred.sum(1, keepdim=True).clamp(min=1)
         return gp.half(), ga.half()
 
     def _write_example_dump(self, path: Path, row_tasks: List[str], S: List[List[float]],
@@ -1087,6 +1091,8 @@ class GatedLoRATrainer:
         if ex_gates:
             arrays["gate_prompt"] = torch.cat([g[0] for g in ex_gates]).cpu().numpy()
             arrays["gate_answer"] = torch.cat([g[1] for g in ex_gates]).cpu().numpy()
+            # older dumps averaged gate_answer over the answer tokens themselves (one late)
+            arrays["gate_positions"] = np.array("predicting")
         tmp = path.with_name(path.name + ".tmp.npz")
         np.savez_compressed(tmp, **arrays)
         os.replace(tmp, path)
@@ -1103,7 +1109,8 @@ class GatedLoRATrainer:
 
         ``dump_path``: also write per-example arrays (npz, see `_write_example_dump`): task,
         example_idx, prompt_len, answer NLL sum / token count / correct count and, for gated
-        models, the per-layer mean gate weights over PROMPT tokens and over ANSWER tokens.
+        models, the per-layer mean gate weights over the positions predicting PROMPT and
+        ANSWER tokens (`_row_gate_means`).
         """
         loader = self._eval_loader(which, samples_per_task)
         prev_collect = getattr(self.model, "collect_routing_stats", None)
