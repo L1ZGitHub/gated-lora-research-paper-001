@@ -51,10 +51,23 @@ FIG1_ARMS = {  # version -> [(label, config, seeds, emphasised)]; the first entr
         ("Gated, equal ranks 19/19/18", "equal_rank", range(3), False),
         ("Frozen random gate", "frozen_gate", range(3), False),
     ],
+    "v3small": [  # Phase C': small ranks; r16 and r32 are the Phase B' runs
+        ("Gated 2/4/8", "gated_r2r4r8_lr1em4", range(5), True),
+        ("LoRA r14 (= routing off)", "baseline_r14_lr1em4", range(5), False),
+        ("LoRA r8", "baseline_r8_lr1em4", range(5), False),
+        ("LoRA r4", "baseline_r4_lr2p5em4", range(5), False),
+        ("LoRA r2", "baseline_r2_lr2p5em4", range(5), False),
+        ("LoRA r16", "baseline_r16_lr1em4", range(5), False),
+        ("LoRA r32", "baseline_r32_lr5em5", range(5), False),
+    ],
 }
+RANKS = {"v3small": (2, 4, 8)}  # expert ranks of the gated arm (default 8/16/32)
+SUFFIX = {"v3small": "_small"}  # figure file suffix
 FIG1_NOTE = {"v2": "LR 5e-5 for every arm.",
              "v3": "LR per arm from the Phase A' grid (gated, r66, r56 and controls 2.5e-5; "
-                   "r32 5e-5; r16 1e-4)."}
+                   "r32 5e-5; r16 1e-4).",
+             "v3small": "LR per arm from the Phase C' grid (gated, r14, r8, r16 1e-4; r4, r2 "
+                        "2.5e-4; r32 5e-5)."}
 VERSION = "v2"
 GATES_DIR = None  # --gates-dir: re-dumped per-example files (knockout_v2.py --dump-dir)
 INK, INK2, GRID, SURF = "#0b0b0b", "#52514e", "#e4e3df", "#ffffff"
@@ -121,7 +134,7 @@ def fig1(out: Path) -> None:
         t.set_color(INK if a[3] else INK2)
     fig.text(0.0, -0.10, "Hollow circles: seeds. Filled: mean ± 1 s.d. Diamond: single seed. "
              f"Dashed line: gated mean. {FIG1_NOTE[VERSION]}", color=INK2, fontsize=7)
-    save(fig, out, "fig1_q1_losses")
+    save(fig, out, "fig1_q1_losses" + SUFFIX.get(VERSION, ""))
 
 
 def routing_shares() -> tuple[list[str], np.ndarray]:
@@ -141,7 +154,8 @@ def fig2(out: Path) -> None:
     tasks, m = routing_shares()
     cmap = LinearSegmentedColormap.from_list("seq", SEQ)
     fig, axes = plt.subplots(1, 3, figsize=(6.9, 2.5), sharey=True)
-    for e, (ax, name) in enumerate(zip(axes, ("rank-8 expert", "rank-16 expert", "rank-32 expert"))):
+    ranks = RANKS.get(VERSION, (8, 16, 32))
+    for e, (ax, name) in enumerate(zip(axes, [f"rank-{r} expert" for r in ranks])):
         im = ax.imshow(m[:, :, e], cmap=cmap, vmin=0, vmax=1, aspect="auto", interpolation="nearest")
         ax.set_title(name, loc="left", pad=5)
         ax.set_xticks([0, 6, 12, 18, 23])
@@ -157,9 +171,9 @@ def fig2(out: Path) -> None:
     cb.ax.tick_params(length=0)
     fig.suptitle("Share of gate weight per task and layer", x=0.0, ha="left", y=1.04,
                  fontsize=8.5, color=INK)
-    fig.text(0.0, -0.08, "Gated 8/16/32 model, test split, answer tokens, mean of 5 seeds. "
+    fig.text(0.0, -0.08, f"Gated {'/'.join(map(str, ranks))} model, test split, answer tokens, mean of 5 seeds. "
              "For each cell, the three panels sum to 1.", color=INK2, fontsize=7)
-    save(fig, out, "fig2_routing")
+    save(fig, out, "fig2_routing" + SUFFIX.get(VERSION, ""))
 
 
 def fig3(out: Path, ko_dir: str) -> None:
@@ -185,7 +199,7 @@ def fig3(out: Path, ko_dir: str) -> None:
     ax.set_xticklabels([b for _, b in cols])
     for j in (3.5, 7.5):
         ax.axvline(j, color=SURF, lw=3)
-    for e, name in enumerate(("rank-8 removed", "rank-16 removed", "rank-32 removed")):
+    for e, name in enumerate([f"rank-{r} removed" for r in RANKS.get(VERSION, (8, 16, 32))]):
         ax.text(e * 4 + 1.5, -0.95, name, ha="center", va="bottom", color=INK, fontsize=8)
     ax.set_yticks(range(len(TASK_ORDER)))
     ax.set_yticklabels(TASK_ORDER)
@@ -195,7 +209,7 @@ def fig3(out: Path, ko_dir: str) -> None:
     ax.tick_params(length=0)
     fig.text(0.0, -0.07, "Change in test answer loss vs the intact model (red: worse, blue: better), "
              "mean of 5 seeds; colour on a symmetric log scale.", color=INK2, fontsize=7)
-    save(fig, out, "fig3_knockout")
+    save(fig, out, "fig3_knockout" + SUFFIX.get(VERSION, ""))
 
 
 def main() -> None:
@@ -206,7 +220,7 @@ def main() -> None:
     ap.add_argument("--out", default="figures")
     args = ap.parse_args()
     global VERSION, P, GATES_DIR
-    VERSION, P, GATES_DIR = args.version, f"{args.version}_qwen25_05b_", args.gates_dir
+    VERSION, P, GATES_DIR = args.version, f"{args.version[:2]}_qwen25_05b_", args.gates_dir
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     fig1(out)

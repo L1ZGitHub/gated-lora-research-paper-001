@@ -28,17 +28,24 @@ rate chosen separately for each arm and a test protocol fixed before the runs.
 \textbf{Efficiency:} the gated model is statistically equivalent to every plain LoRA we tried and
 better than none. Its macro test loss is $0.7850$ against $0.7836$--$0.7846$ for plain LoRA of
 rank 16 to 66; all four differences lie within a pre-specified margin of $0.005$ (two one-sided
-tests, Holm-adjusted $p=0.001$) and none is significant. A rank-16 LoRA with a quarter of the
-trainable parameters does as well, so adapter capacity is not the bottleneck here.
+tests, Holm-adjusted $p=0.001$) and none is significant. A second round, specified in advance,
+goes down to a 2/4/8 mixture and plain ranks 2 to 14 with the same outcome: the mixture is
+equivalent to each of them, and rank 2 (1.1M parameters) is within $0.0010$ of rank 16, so
+adapter capacity is never the bottleneck here.
 \textbf{Interpretability:} trained routing is reproducible across seeds (correlation $0.71$
 between seeds' task $\times$ layer $\times$ expert maps, against $0.46$ with equal-rank experts
 and $0.02$ for frozen random gates), but most of what makes it look meaningful is not learned.
 Frozen random gates are already task-dependent (the task explains 52--63\% of their variance,
 against 65--85\% after training), and the trained router sends 71\% of its weight to the rank-32
-expert. Removing both small experts from every layer changes the test loss by $+0.0002$. Routing
-does not follow task difficulty. Knockouts chosen per task on validation data lower the gated
-model's test loss by $0.0024$ in every seed, a small edit that the same procedure does not find
-in plain LoRA.
+expert. Removing both small experts from every layer changes the test loss by $+0.0002$. With
+ranks 2/4/8 the weight is spread more evenly (45\% on the largest expert) and ordered by task
+(tasks with a lower loss use larger experts, Spearman $-0.90$ to $-0.95$ in five seeds), but the
+knockouts are unchanged: the largest expert carries the adaptation, and removing the rank-2
+expert, which holds a third of the gate weight, changes the mean loss by $-0.0005$. Gate weights
+are a reproducible and partly faithful readout of where the dominant expert is used; they are
+not a measure of how much each expert matters. Knockouts chosen per task on validation data
+lower the gated models' test loss by about $0.002$ in every seed; plain LoRA gets at most a
+third of that from the same procedure.
 \end{abstract}
 
 \section{Introduction}
@@ -67,8 +74,11 @@ routing is reproducible across seeds, which random gates and, to a lesser degree
 experts are not; but its task dependence is mostly inherited from the hidden states, it
 concentrates on the largest expert, it does not follow difficulty, and it predicts an expert's
 importance only for that largest expert (Section~\ref{sec:q2}). (iii) Removing experts per task
-gives the gated model a small, consistent test gain that plain LoRA does not get from the same
-procedure (Section~\ref{sec:pertask}).
+gives the gated model a small, consistent test gain, several times what plain LoRA gets from the
+same procedure (Section~\ref{sec:pertask}). (iv) A second round with experts of rank 2/4/8 and plain
+ranks 2 to 14, specified before it was run, repeats (i) and shows that rank is not binding even
+at rank 2. Its routing is more spread and more clearly ordered by task, yet the largest expert
+still does almost all the measurable work (Section~\ref{sec:small}).
 
 \section{Method}
 \label{sec:method}
@@ -94,6 +104,11 @@ plain LoRA with rank $8{+}16{+}32$, which is exactly the gated model with routin
 with gates never trained and no auxiliary gate loss, rescaled per layer at initialization so that
 their mean top-1 weight matches the trained gates': target $0.723$, achieved $0.725$; the trained
 gates' five-seed mean is $0.717$).
+
+\paragraph{Small-rank arms.} A second round (Section~\ref{sec:small}) uses the same gated model
+with experts of rank 2/4/8 ($\alpha_e = 2 r_e$, gate networks unchanged; 13.2M trainable
+parameters, of which 5.5M are gates) and plain \textbf{LoRA r14} (the 2/4/8 model with routing
+switched off, 7.7M), \textbf{r8} (4.4M), \textbf{r4} (2.2M) and \textbf{r2} (1.1M).
 
 \section{Experimental setup}
 \label{sec:setup}
@@ -283,15 +298,16 @@ $\times$ block cases, $0.24$--$0.64$) against $+0.11$ for frozen gates ($-0.24$ 
 about zero for the two small experts, whose removal causes no damage to rank. The gate weights
 are thus informative about the one expert that matters and uninformative about the other two.
 
-\section{Per-task expert removal: a small gain specific to the gated model}
+\section{Per-task expert removal: a small gain, larger for the gated model}
 \label{sec:pertask}
 \begin{table}[t]
 \centering
 \caption{Test macro answer loss when, for each task, the removal that minimizes that task's
 \emph{validation} loss is applied (chosen per seed; scored on test; mean of five seeds). Gated:
-six options (none; rank-8+16 removed from all, early, middle or late layers; rank-32 removed
-from middle layers). Plain LoRA: five options (none; whole adapter removed from all, early,
-middle or late layers). In parentheses: seeds that chose a removal for that task.}
+six options (none; the two smaller experts removed from all, early, middle or late layers; the
+largest expert removed from middle layers). Plain LoRA: five options (none; whole adapter
+removed from all, early, middle or late layers). In parentheses: seeds that chose a removal for
+that task. Lower block: the small-rank round of Section~\ref{sec:small}.}
 \label{tab:pertask}
 \begin{tabular}{lcccc}
 \toprule
@@ -300,6 +316,9 @@ middle or late layers). In parentheses: seeds that chose a removal for that task
 Gated 8/16/32 & 0.7850 & 0.7826 & $-0.0115$ (5/5) & $-0.0060$ (5/5) \\
 LoRA r66      & 0.7843 & 0.7841 & $-0.0011$ (3/5) & $-0.0005$ (3/5) \\
 LoRA r56      & 0.7843 & 0.7843 & $\phantom{-}0.0000$ (0/5) & $-0.0001$ (2/5) \\
+\midrule
+Gated 2/4/8   & 0.7842 & 0.7822 & $-0.0077$ (5/5) & $-0.0062$ (5/5) \\
+LoRA r14      & 0.7840 & 0.7834 & $-0.0040$ (5/5) & $-0.0005$ (2/5) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -313,19 +332,161 @@ layers ($-0.0115$ on that task); for CommonsenseQA, removing both small experts 
 ($-0.0060$). SQuAD keeps every expert in every seed. The same procedure on plain LoRA, where a
 block's whole adapter is removed, finds almost nothing: $-0.0002$ for r66 and $0.0000$ for r56.
 
+The small-rank round repeats the pattern with one difference. The 2/4/8 model gains $0.0020$
+($0.0018$ to $0.0023$ per seed); GSM8K removes both small experts from all layers in every seed.
+Plain LoRA r14 gains $0.0006$ ($0.0001$ to $0.0012$), nearly all of it on GSM8K, where every seed
+removes the adapter from the early or the middle layers ($-0.0040$ on that task). GSM8K is
+therefore slightly over-adapted in plain LoRA too, at least at small rank; the expert structure
+finds a larger share of that gain and a second one on CommonsenseQA.
+
 Three cautions apply. The gain is small ($0.3\%$ of the loss) and we did not specify a test for
 it in advance. The comparison with plain LoRA is not like for like, because the gated model
 offers finer options (one expert in one block) than a plain adapter does. And the edited model
 uses the task identity at test time, so its $0.7826$ should not be compared with the unedited
 arms of Table~\ref{tab:q1}. What the result does show is that the expert structure makes a
-trained model editable per task in a way that survives a validation/test split.
+trained model editable per task in a way that survives a validation/test split, in both
+mixtures.
+
+\section{A smaller mixture: ranks 2/4/8}
+\label{sec:small}
+Section~\ref{sec:q1} left open whether gating helps when rank is scarce. After reading those
+results and before any new run, we fixed a second round: the same model, data, splits, steps and
+metric, with a 2/4/8 mixture and plain LoRA of rank 2, 4, 8 and 14; a nine-point learning-rate
+grid from $10^{-5}$ to $5\times10^{-3}$ per arm on one seed (Appendix~\ref{app:lr}), then five
+seeds per arm; the Q1 tests against the four plain arms; and a criterion for scarcity: a plain
+rank counts as \emph{capacity-bound} if its test loss differs from LoRA r16 (Welch,
+Holm-adjusted $p<0.05$ over the four ranks) and exceeds it by more than $0.005$. The selected
+rates are $10^{-4}$ for the mixture, r14 and r8 and $2.5\times10^{-4}$ for r4 and r2.
+
+\begin{table}[t]
+\centering
+\caption{Small-rank round, five seeds per arm. Macro answer loss (mean $\pm$ s.d.) and Q1 tests
+of the 2/4/8 model minus each arm on the test loss, as in Table~\ref{tab:q1tests} (Holm over the
+four small plain arms; r16 and r32, from Table~\ref{tab:q1}, were specified as untested
+references).}
+\label{tab:small}
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrcccccc}
+\toprule
+Arm & Params & Validation & Test & Difference & 95\% CI & $p$ & $p_{\mathrm{eq}}$ \\
+\midrule
+Gated 2/4/8 & 13.2M & $0.7726 \pm 0.0014$ & $0.7842 \pm 0.0012$ & & & & \\
+LoRA r14    &  7.7M & $0.7723 \pm 0.0013$ & $0.7840 \pm 0.0011$ & $+0.0002$ & $[-0.0015, +0.0019]$ & 0.90 & $<0.001$ \\
+LoRA r8     &  4.4M & $0.7729 \pm 0.0016$ & $0.7837 \pm 0.0009$ & $+0.0005$ & $[-0.0010, +0.0021]$ & 0.90 & $<0.001$ \\
+LoRA r4     &  2.2M & $0.7740 \pm 0.0012$ & $0.7850 \pm 0.0008$ & $-0.0008$ & $[-0.0024, +0.0007]$ & 0.68 & $<0.001$ \\
+LoRA r2     &  1.1M & $0.7752 \pm 0.0012$ & $0.7856 \pm 0.0011$ & $-0.0014$ & $[-0.0031, +0.0003]$ & 0.37 & $<0.001$ \\
+\midrule
+LoRA r16    &  8.8M & $0.7727 \pm 0.0012$ & $0.7846 \pm 0.0013$ & $-0.0004$ & $[-0.0022, +0.0015]$ & & \\
+LoRA r32    & 17.6M & $0.7719 \pm 0.0012$ & $0.7836 \pm 0.0013$ & $+0.0005$ & $[-0.0013, +0.0024]$ & & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Rank is not binding even at rank 2.} No plain rank is capacity-bound
+(Table~\ref{tab:small}): LoRA r2 is $0.0010$ above r16 (Holm-adjusted $p=0.88$), r4 $0.0005$
+above, r8 and r14 slightly below. The loss does rise below rank 8, by $0.0019$ from r8 to r2 on
+test and $0.0023$ on validation, but this stays under half the margin. A 1.1M-parameter adapter
+is thus within $0.0013$ of a 36.3M-parameter one (LoRA r66), and the round cannot say anything
+about gating under scarcity; we report it as a second regime where capacity is ample.
+
+\paragraph{Q1 again.} The 2/4/8 model is equivalent to each small plain LoRA within $0.005$ and
+better than none: its mean loss lies between those of r14 and r8 (slightly lower) and of r4 and
+r2 (slightly higher), and every 95\% interval lies inside $\pm 0.0031$. The check on losses divided by the base model's loss agrees
+(differences $-0.0003$ to $+0.0008$, Holm-adjusted $p \geq 0.16$). Equal macro losses hide
+per-task differences of up to $0.02$ between ranks (Appendix~\ref{app:pertask}): against r14,
+LoRA r2 is better on CommonsenseQA ($-0.0160$) and GSM8K ($-0.0092$) and worse on XSum
+($+0.0184$) and WikiText ($+0.0075$). Rank and learning rate change together between these arms, so we do not
+attribute the pattern to rank.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig2_routing_small.pdf}
+\caption{Share of gate weight per task and layer for the 2/4/8 model, as in
+Figure~\ref{fig:routing}.}
+\label{fig:routingsmall}
+\end{figure}
+
+\paragraph{Routing is more spread and ordered by task.} The rank-8 expert receives $0.45$ of the
+gate weight, the rank-4 expert $0.22$ and the rank-2 expert $0.33$
+(Figure~\ref{fig:routingsmall}), against $0.71$, $0.18$ and $0.11$ for the large mixture. The
+rank-2 expert is the most used in the middle layers ($0.45$) and the rank-8 expert in the late
+ones ($0.59$), where its share ranges from $0.22$ for XSum to $0.85$ for CoNLL-2003, about
+twice the spread of the rank-32 share in the large mixture ($0.63$ to $0.96$). The task explains 69\%, 73\% and 84\% of the
+gate variance in early, middle and late layers. Across tasks, the expected rank falls as the
+task's answer loss rises, with a Spearman correlation between $-0.90$ and $-0.95$ in each of the
+five seeds (the large mixture gave $-0.07$ to $-0.52$): CoNLL-2003 and IMDB use the largest
+expert most, XSum and WikiText least. Within a task the relation stays weak ($-0.10$ to
+$-0.20$). With eight tasks, loss level cannot be separated from task type: the weight on the
+rank-8 expert correlates as well with the relative loss reduction from fine-tuning ($+0.88$ to
+$+0.90$, not planned in advance), so ``more capacity where adaptation changes more'' fits as
+well as ``less capacity for harder tasks''.
+
+\paragraph{What reproduces across seeds and what does not.} The seed-to-seed correlation of the
+task-centred maps is $0.61$ (ten pairs, $0.54$--$0.71$), lower than the $0.71$ of the large
+mixture and far above the $0.02$ of random gates; no frozen or equal-rank control was trained
+for this mixture. The shares per task and block of eight layers vary by at most $0.08$ (s.d.)
+across seeds. The depth profile reproduces less well. The correlation between seeds of the
+layer $\times$ expert profile (shares averaged over tasks) is $0.61$ ($0.48$--$0.75$), against
+$0.94$ for the large mixture; taken per expert it is $0.68$ for the rank-8 expert, $0.52$ for
+the rank-2 expert and $0.09$ for the rank-4 expert. At single layers the rank-2 share ranges,
+for example, from $0.13$ to $0.73$ (layer 9) and from $0.01$ to $0.61$ (layer 4). How the
+weight not given to the rank-8 expert is split between the two small ones at a given layer is
+thus largely arbitrary, while the shares per task and block are stable.
+
+\begin{table}[t]
+\centering
+\caption{Change in macro test loss when one expert of the 2/4/8 model is removed from a block of
+layers (mean of five seeds), and Spearman correlation across tasks between the gate weight on
+that expert and the damage (mean over the three blocks and the seeds; range in parentheses).}
+\label{tab:kosmall}
+\small
+\begin{tabular}{lccccc}
+\toprule
+Removed & Early & Middle & Late & All layers & Usage--damage $\rho$ \\
+\midrule
+Rank 2 & $-0.0005$ & $-0.0007$ & $+0.0004$ & $-0.0005$ & $+0.01$ ($-0.67$ to $0.38$) \\
+Rank 4 & $\phantom{-}0.0000$ & $-0.0003$ & $+0.0035$ & $+0.0033$ & $+0.24$ ($-0.24$ to $0.90$) \\
+Rank 8 & $+0.0228$ & $+0.0096$ & $+0.1030$ & $+0.4192$ & $+0.48$ ($0.14$ to $0.86$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Knockouts: still one expert.} Table~\ref{tab:kosmall} repeats the knockouts. Removing
+the rank-8 expert everywhere costs $0.42$; the two small experts alone keep about four fifths of
+the fine-tuning gain. Removing the rank-2 expert everywhere changes the macro loss by $-0.0005$,
+although it holds a third of the gate weight and its update is not small: the Frobenius norm of
+$B_e A_e$, averaged over layers, is $0.50$, $0.66$ and $0.92$ for the three experts (same
+$\alpha_e / r_e$). Neither the gate share nor the size of the update predicts that this expert
+can be removed for free. The rank-4 expert matters in the late layers only ($+0.0035$), and
+removing both small experts everywhere costs $0.0072$, against $0.0002$ in the large mixture.
+As there, the averages hide opposite effects per task: without the rank-2 expert XSum loses
+$0.007$ while CommonsenseQA and GSM8K gain $0.007$ and $0.005$; without the rank-4 expert
+WikiText loses $0.023$, all of it in the late layers.
+
+\paragraph{Faithfulness.} The pre-specified summary is $+0.24$ ($+0.14$ for the large mixture).
+Per expert it is $+0.48$ for the rank-8 expert, positive in all fifteen seed $\times$ block
+cases, $+0.24$ with mixed signs for the rank-4 expert, and $+0.01$ for the rank-2 expert, for
+which the middle block is negative in every seed (mean $-0.34$): the tasks that put more weight
+on the rank-2 expert there are those that do \emph{better} without it. The reading of
+Section~\ref{sec:q2} holds: the gate weights describe the use of the largest expert and little
+else.
 
 \section{Discussion}
-On this benchmark the gated mixed-rank LoRA is a more complicated way to reach the accuracy of a
-plain LoRA. The simplest reading of the rank curve explains why: test loss does not change
-between rank 16 and rank 66, so there is no capacity shortage for a router to manage. The router
-itself mostly gives up the mixture, sending 71\% of the weight to the rank-32 expert and leaving
-two experts whose removal goes unnoticed on average.
+On this benchmark the gated mixed-rank LoRA reaches the accuracy of a plain LoRA, no more and
+no less, with two mixtures. The rank curve explains why it cannot do more: test loss varies by
+$0.002$ across plain ranks from 2 to 66, so there is no capacity shortage for a router to
+manage. The price is the gate network (5.5M parameters, 42\% of the trainable parameters of the
+2/4/8 model) and about 30\% more wall-clock time per run in our setup.
+
+What gating buys at that price is a readout that plain LoRA does not have, and the two mixtures
+show how far it can be trusted. Supported in both: the weight on the largest expert, per task
+and per block of layers, is stable across seeds and tracks the damage of removing that expert;
+and the expert structure allows small per-task edits that hold on test data. Not supported in
+either: reading a gate weight as importance. In the large mixture the router sends 71\% of the
+weight to one expert and the rest goes unnoticed; in the small mixture the rank-2 expert
+receives a third of the weight and can be removed at no average cost. One reading fits both
+without being tested here: the share of the largest expert acts as a per-task, per-layer
+strength of adaptation, and the remaining weight is parked on experts that matter little.
 
 For interpretability, the controls matter more than the headline numbers. Task-dependent gate
 weights are not evidence of learned routing, since random gates have them too. Reproducibility
@@ -337,7 +498,12 @@ measure.
 
 \section{Limitations}
 One base model (0.5B parameters) and one task mixture; the conclusions may change for larger
-models or when rank is binding. \todo{replicate on a second model (Pythia-410M or SmolLM-360M).}
+models or when rank is binding, which this benchmark never is down to rank 2.
+\todo{replicate on a second model (Pythia-410M or SmolLM-360M).} The small mixture has no
+frozen-gate or equal-rank control and trains at four times the learning rate of the large one,
+so differences between the two routing maps are not attributable to rank alone. For that
+mixture, the per-layer seed comparison, the correlation with the loss reduction, the update
+norms and the per-task removal on LoRA r14 were not specified in advance.
 Each arm's learning rate comes from a single seed on a nine-point grid; the validation curves are
 flat near their minimum (Appendix~\ref{app:lr}), but a different seed could select a neighbouring
 value. Controls have three seeds. The equivalence margin and three corrections to the routing
@@ -377,6 +543,28 @@ extended again. For LoRA r16 the two best values differ by $2\times10^{-5}$ of l
 largest rates the gated model degrades less than LoRA r66 ($0.858$ vs.\ $1.254$ at $10^{-3}$);
 this is a single-seed observation that we did not follow up.
 
+\begin{table}[h]
+\centering
+\small
+\caption{Small-rank round: validation macro answer loss by learning rate (seed 0, last step).
+Bold: selected value. ``div.'': the run stopped on a non-finite loss.}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{lccccccccc}
+\toprule
+ & $10^{-5}$ & $2.5{\times}10^{-5}$ & $5{\times}10^{-5}$ & $10^{-4}$ & $2.5{\times}10^{-4}$ & $5{\times}10^{-4}$ & $10^{-3}$ & $2.5{\times}10^{-3}$ & $5{\times}10^{-3}$ \\
+\midrule
+Gated 2/4/8 & 0.7909 & 0.7773 & 0.7738 & \textbf{0.7734} & 0.7809 & 0.7851 & 0.7870 & div. & div. \\
+LoRA r14    & 0.7985 & 0.7815 & 0.7741 & \textbf{0.7725} & 0.7816 & 0.7922 & 0.8283 & div. & div. \\
+LoRA r8     & 0.8074 & 0.7871 & 0.7775 & \textbf{0.7728} & 0.7774 & 0.7857 & 0.8035 & 0.9747 & div. \\
+LoRA r4     & 0.8187 & 0.7958 & 0.7834 & 0.7758 & \textbf{0.7726} & 0.7783 & 0.7953 & 0.8257 & div. \\
+LoRA r2     & 0.8298 & 0.8050 & 0.7898 & 0.7802 & \textbf{0.7756} & 0.7771 & 0.7840 & 0.8019 & div. \\
+\bottomrule
+\end{tabular}
+\end{table}
+The small-rank grid was shifted up because the best rate rose as the rank fell; a diverged run
+counts as worse than any finite one, and no minimum falls on an edge. For the 2/4/8 model the
+two best values differ by $0.0004$.
+
 \section{Per-task test loss}
 \label{app:pertask}
 \begin{table}[h]
@@ -395,6 +583,12 @@ LoRA r16      & 0.2019 & 0.0835 & 0.6475 & 0.0774 & 0.1956 & 0.3553 & 2.7373 & 1
 \midrule
 Equal ranks   & 0.1982 & 0.0844 & 0.6457 & 0.0792 & 0.1947 & 0.3569 & 2.7343 & 1.9774 \\
 Frozen gate   & 0.2060 & 0.0870 & 0.6514 & 0.0766 & 0.1948 & 0.3587 & 2.7378 & 1.9792 \\
+\midrule
+Gated 2/4/8   & 0.2003 & 0.0838 & 0.6447 & 0.0775 & 0.1950 & 0.3535 & 2.7409 & 1.9778 \\
+LoRA r14      & 0.1984 & 0.0833 & 0.6453 & 0.0778 & 0.1936 & 0.3566 & 2.7372 & 1.9799 \\
+LoRA r8       & 0.1851 & 0.0830 & 0.6374 & 0.0802 & 0.1955 & 0.3614 & 2.7374 & 1.9894 \\
+LoRA r4       & 0.1922 & 0.0826 & 0.6387 & 0.0791 & 0.1969 & 0.3557 & 2.7467 & 1.9885 \\
+LoRA r2       & 0.1824 & 0.0815 & 0.6361 & 0.0821 & 0.1971 & 0.3625 & 2.7447 & 1.9983 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -415,5 +609,14 @@ task-centred gate shares with per-layer expert matching for equal-rank experts, 
 correlation of expected-rank maps, which a depth profile shared by all tasks inflates and which
 is ill-defined for interchangeable experts. Every reloaded model reproduces its logged test loss
 to within $10^{-8}$.
+
+\paragraph{Small-rank round.} Fixed after the results of Sections~\ref{sec:q1}--\ref{sec:pertask}
+were known and before any of its runs: the five arms, the nine-point grid and the selection rule
+(including that a diverged run counts as worst and that the grid is not extended), five seeds
+per arm, the capacity-bound criterion against LoRA r16, the Q1 tests against the four small
+plain arms with r16 and r32 as untested references, and the same Q2 analyses on the 2/4/8 model
+without new controls. The protocol was followed without amendment. One run's final upload of
+its result files failed after training and evaluation had finished; the files were uploaded by
+hand from the compute node and nothing was recomputed.
 
 \end{document}
