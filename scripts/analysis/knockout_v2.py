@@ -151,6 +151,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", choices=["v2", "v3"], default="v3")
+    ap.add_argument("--model", default="qwen25_05b", help="model tag of the run names (e.g. smollm360m)")
     ap.add_argument("--runs", nargs="+", required=True)
     ap.add_argument("--out-dir", default="ko_results")
     ap.add_argument("--split", default="final", choices=["final", "val"],
@@ -163,7 +164,7 @@ def main() -> None:
                     help="also write the intact model's per-example dump (routing) here")
     args = ap.parse_args()
     global VERSION, P
-    VERSION, P = args.version, f"{args.version}_qwen25_05b_"
+    VERSION, P = args.version, f"{args.version}_{args.model}_"
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     if args.dump_dir:

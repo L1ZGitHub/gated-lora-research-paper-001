@@ -1,0 +1,44 @@
+{
+ "config": "configs/experiments/v3/v3_smollm360m_baseline_r14_lr1em4.yaml",
+ "data_format": "v3",
+ "val": {
+  "commonsenseqa": 1.360414925682148,
+  "conll2003": 2.545726390579314,
+  "gsm8k": 1.3851765891914714,
+  "imdb": 6.487703340530396,
+  "mnli": 9.060178692430359,
+  "squad": 2.240717115056986,
+  "wikitext": 3.0982872680338356,
+  "xsum": 2.580507365704971
+ },
+ "val_num_examples": {
+  "commonsenseqa": 487,
+  "conll2003": 500,
+  "gsm8k": 374,
+  "imdb": 500,
+  "mnli": 500,
+  "squad": 500,
+  "wikitext": 500,
+  "xsum": 500
+ },
+ "final": {
+  "commonsenseqa": 1.3715824122726599,
+  "conll2003": 2.737698721290829,
+  "gsm8k": 1.3533519688484557,
+  "imdb": 6.481145924806595,
+  "mnli": 9.046041971180626,
+  "squad": 2.487878924205889,
+  "wikitext": 3.073549341738666,
+  "xsum": 2.5902303812155445
+ },
+ "final_num_examples": {
+  "commonsenseqa": 1000,
+  "conll2003": 1000,
+  "gsm8k": 1000,
+  "imdb": 1000,
+  "mnli": 1000,
+  "squad": 1000,
+  "wikitext": 1000,
+  "xsum": 1000
+ }
+}

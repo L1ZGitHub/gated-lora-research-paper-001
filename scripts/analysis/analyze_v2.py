@@ -67,7 +67,11 @@ VERSIONS = {  # version -> arm -> (config, seeds, expert ranks or None)
     },
 }
 SECONDARY = {"v3small": ("r16", "r32")}  # reported with CIs, outside the Holm family
-CAPACITY = {"v3small": ("r16", ("r14", "r8", "r4", "r2"))}  # reference arm, arms tested against it
+CAPACITY = {"v3small": ("r16", ("r14", "r8", "r4", "r2")),  # reference arm, arms tested against it
+            "v3smollm": ("r56", ("r14", "r2"))}
+MODELS = {"v3smollm": "smollm360m"}  # version -> model tag of the run names (default qwen25_05b)
+# Q1 reference arm per plain arm when a version has two gated models (default: "gated")
+Q1_REF = {"v3smollm": {"r14": "gated_small", "r2": "gated_small"}}
 DELTA = 0.005  # Q1 equivalence margin (macro test loss, nats; README v3 amendment)
 P, ARMS = "v3_qwen25_05b_", VERSIONS["v3"]  # set by --version
 VERSION = "v3"
@@ -146,6 +150,7 @@ def q1(base_ref: str | None) -> dict:
 
     per = {arm: [json.load(open(get(f"{cfg}_seed{s}", "eval_results.json")))["final"]["per_task"]
                  for s in seeds] for arm, (cfg, seeds, _) in ARMS.items()}
+    ref = Q1_REF.get(VERSION, {})
     secondary = [b for b in per if b in SECONDARY.get(VERSION, ())]
     others = [b for b in per if ARMS[b][2] is None and b not in secondary]
     tasks = sorted(per["gated"][0])
@@ -164,10 +169,9 @@ def q1(base_ref: str | None) -> dict:
     for metric, w in metrics:
         macro = {a: np.array([np.mean([m["answer_loss"] * w(t) for t, m in pt.items()]) for pt in rows])
                  for a, rows in per.items()}
-        g = macro["gated"]
         res = {}
         for b in others + secondary:
-            x = macro[b]
+            x, g = macro[b], macro[ref.get(b, "gated")]
             d = g.mean() - x.mean()
             vg, vx = g.var(ddof=1) / len(g), x.var(ddof=1) / len(x)
             df = (vg + vx) ** 2 / (vg ** 2 / (len(g) - 1) + vx ** 2 / (len(x) - 1))
@@ -182,6 +186,8 @@ def q1(base_ref: str | None) -> dict:
                       "p": float(stats.ttest_ind(g, x, equal_var=False).pvalue),
                       "p_tost": float(p_tost),
                       "mean": float(x.mean()), "sd": float(x.std(ddof=1)), "n": len(x)}
+            if ref:
+                res[b]["ref"] = ref.get(b, "gated")
         p_holm = holm({b: res[b]["p"] for b in others})
         p_tost_holm = (holm({b: res[b]["p_tost"] for b in others}) if metric == "raw"
                        else {b: float("nan") for b in others})
@@ -197,6 +203,7 @@ def q1(base_ref: str | None) -> dict:
             # is "no detectable difference", not a failed equivalence
             res[b]["verdict"] = ("; ".join(v for v in (sup, eq) if v)
                                  or ("inconclusive" if metric == "raw" else "no detectable difference"))
+        g = macro["gated"]
         out[metric] = {"gated": {"mean": float(g.mean()), "sd": float(g.std(ddof=1)), "n": len(g)},
                        "vs": res, "per_seed": {a: v.tolist() for a, v in macro.items()}}
         print(f"\n== Q1 ({metric}{', primary' if metric == 'raw' else ', robustness'}): "
@@ -206,6 +213,7 @@ def q1(base_ref: str | None) -> dict:
         for b in others + secondary:
             r = res[b]
             print(f"  {b:5s} {r['mean']:8.4f} {r['sd']:7.4f} {r['diff']:+9.4f} "
+                  + (f"({r['ref']}) " if ref else "") +
                   f"[{r['ci95'][0]:+.4f}, {r['ci95'][1]:+.4f}] {r['p']:6.3f} {r['p_holm']:6.3f} "
                   f"[{r['ci90'][0]:+.4f}, {r['ci90'][1]:+.4f}] {r['p_tost']:6.3f} "
                   f"{r['p_tost_holm']:6.3f}  {r['verdict']}")
@@ -239,13 +247,15 @@ def capacity() -> dict:
     return out
 
 
-def routing() -> dict:
+def routing(base_ref: str | None = None) -> dict:
     out = {}
+    base = json.load(open(base_ref))["final"] if base_ref else None
     for arm, (cfg, seeds, ranks) in ARMS.items():
         if ranks is None:
             continue
         r = np.asarray(ranks, float)
         maps, shares, eta_l, etav_l, rho_task, rho_ex = [], [], [], [], [], []
+        raw, rho_gain = [], []  # uncentred shares [T, L, E]; largest-expert share vs relative gain
         for s in seeds:
             z = examples(f"{cfg}_seed{s}")
             g = z["gate_answer"].astype(np.float32)  # [N, L, E]
@@ -266,12 +276,16 @@ def routing() -> dict:
             maps.append(m)
             sh = np.stack([g[ok & (task == t)].mean(0) for t in tasks])  # [T, L, E] gate share
             shares.append(sh - sh.mean(0))  # centred over tasks: shared depth profile removed
+            raw.append(sh)
             # eta^2 per layer: between-task variance of E[r] / total variance
             tot = er[ok].var(0)
             between = sum((ok & (task == t)).sum() * (er[ok & (task == t)].mean(0) - er[ok].mean(0)) ** 2
                           for t in tasks) / ok.sum()
             eta_l.append(np.where(tot > 0, between / np.maximum(tot, 1e-12), np.nan))
             loss_t = [nll[ok & (task == t)].mean() for t in tasks]
+            if base:  # relative loss reduction from fine-tuning, per task
+                rho_gain.append(spearman(sh[:, :, int(np.argmax(r))].mean(1),
+                                         [1 - lt / base[t] for lt, t in zip(loss_t, tasks, strict=True)]))
             rho_task.append(spearman(loss_t, m.mean(1)))
             rho_ex.append(np.mean([spearman(nll[ok & (task == t)], er[ok & (task == t)].mean(1))
                                    for t in tasks]))
@@ -288,6 +302,10 @@ def routing() -> dict:
                                key=lambda x, li=li: np.corrcoef(a[:, li].ravel(), x.ravel())[0, 1])
                            for li in range(a.shape[1])], axis=1)
             rep.append(float(np.corrcoef(a.ravel(), bm.ravel())[0, 1]))
+        # depth profile (shares averaged over tasks, [L, E]): seed-to-seed correlation
+        prof = [x.mean(0) for x in raw]
+        prof_rep = [float(np.corrcoef(a.ravel(), b.ravel())[0, 1])
+                    for a, b in itertools.combinations(prof, 2)]
         eta = np.nanmean(np.stack(eta_l), 0)
         etav = np.mean(np.stack(etav_l), 0)
         L = maps.shape[2]
@@ -296,6 +314,8 @@ def routing() -> dict:
             "tasks": tasks, "map_mean": maps.mean(0).tolist(), "map_seed_corr": rep,
             "eta2_per_layer": eta.tolist(), "eta2_gate_vector_per_layer": etav.tolist(), "rho_task_difficulty_vs_rank": rho_task,
             "rho_example_difficulty_vs_rank": rho_ex,
+            "share_mean": np.mean(raw, 0).tolist(), "profile_seed_corr": prof_rep,
+            "rho_largest_share_vs_relative_gain": rho_gain,
         }
         print(f"\n== {arm} ({len(maps)} seeds, expert ranks {ranks})")
         print(f"  task-specificity eta^2 (share of E[rank] variance explained by task), "
@@ -310,6 +330,17 @@ def routing() -> dict:
               + " ".join(f"{x:+.2f}" for x in rho_task))
         print(f"  harder example -> bigger rank (within task)? mean Spearman per seed: "
               + " ".join(f"{x:+.2f}" for x in rho_ex))
+        sm = np.mean(raw, 0)  # [T, L, E]
+        fmt = lambda v: "/".join(f"{x:.2f}" for x in v)  # noqa: E731
+        print(f"  depth-profile reproducibility (corr of layer x expert shares between seeds): "
+              f"mean {np.mean(prof_rep):.2f} (min {np.min(prof_rep):.2f})")
+        if rho_gain:
+            print("  Spearman(largest-expert share, relative loss reduction) per seed: "
+                  + " ".join(f"{x:+.2f}" for x in rho_gain))
+        print(f"  gate shares (experts by rank): all {fmt(sm.mean((0, 1)))} | early/mid/late "
+              + " | ".join(fmt(sm[:, s].mean((0, 1))) for s in thirds))
+        for i, t in enumerate(tasks):
+            print(f"    {t:14s} " + " | ".join(fmt(sm[i, s].mean(0)) for s in thirds))
         mm = maps.mean(0)
         print(f"  E[rank] by task (mean over layers; early/mid/late):")
         for i, t in enumerate(tasks):
@@ -418,10 +449,11 @@ def main() -> None:
     args = ap.parse_args()
     global P, ARMS, GATES_DIR, VERSION
     VERSION = args.version
-    P, ARMS = f"{args.version[:2]}_qwen25_05b_", VERSIONS[args.version]
+    P, ARMS = f"{args.version[:2]}_{MODELS.get(args.version, 'qwen25_05b')}_", VERSIONS[args.version]
     GATES_DIR = args.gates_dir
     if args.base_ref is None and args.version.startswith("v3"):
-        args.base_ref = "experiments/v3_base_reference.json"
+        m = MODELS.get(args.version)
+        args.base_ref = f"experiments/v3_base_reference{'_' + m if m else ''}.json"
     args.out = args.out or f"analysis_{args.version}.json"
     if args.q1_only:
         res = {"q1": q1(args.base_ref)}
@@ -432,9 +464,11 @@ def main() -> None:
     elif args.knockout:
         res = {"knockout": knockout(args.knockout)}
     elif args.routing_only:
-        res = {"routing": routing()}
+        res = {"routing": routing(args.base_ref)}
     else:
-        res = {"q1": q1(args.base_ref), "breakdown": breakdown(), "routing": routing()}
+        res = {"q1": q1(args.base_ref), "routing": routing(args.base_ref)}
+        if VERSION not in Q1_REF:  # the gated-minus-baseline breakdown assumes one gated arm
+            res["breakdown"] = breakdown()
         if VERSION in CAPACITY:
             res["capacity"] = capacity()
     with open(args.out, "w") as f:
