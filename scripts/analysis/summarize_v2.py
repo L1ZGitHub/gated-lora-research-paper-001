@@ -21,6 +21,11 @@ V3_LRS = {1e-6: "1em6", 3e-6: "3em6", 1e-5: "1em5", 2.5e-5: "2p5em5", 5e-5: "5em
           2.5e-4: "2p5em4", 5e-4: "5em4", 1e-3: "1em3"}  # v3 Phase A' grid
 V3_LR_SWEEPS = {arm: {lr: f"v3_qwen25_05b_{arm}_lr{tag}" for lr, tag in V3_LRS.items()}
                 for arm in ("gated", "baseline_r66", "baseline_r32", "baseline_r16")}
+V3_SMALL_LRS = {1e-5: "1em5", 2.5e-5: "2p5em5", 5e-5: "5em5", 1e-4: "1em4", 2.5e-4: "2p5em4",
+                5e-4: "5em4", 1e-3: "1em3", 2.5e-3: "2p5em3", 5e-3: "5em3"}  # v3 Phase C' grid
+V3_LR_SWEEPS.update({arm: {lr: f"v3_qwen25_05b_{arm}_lr{tag}" for lr, tag in V3_SMALL_LRS.items()}
+                     for arm in ("gated_r2r4r8", "baseline_r14", "baseline_r8", "baseline_r4",
+                                 "baseline_r2")})
 LR_SWEEPS = {  # v2: arm -> {lr: config basename}
     "gated": {2.5e-5: "v2_qwen25_05b_gated_lr2p5em5", 5e-5: "v2_qwen25_05b_gated_lr5em5", 1e-4: "v2_qwen25_05b_gated_lr1em4", 2e-4: "v2_qwen25_05b_gated",
               4e-4: "v2_qwen25_05b_gated_lr4em4"},
@@ -91,6 +96,7 @@ def main() -> None:
     for arm, sweep in sweeps.items():
         scores = {lr: float(np.mean([x["val_loss"] for x in by_cfg[c]]))
                   for lr, c in sweep.items() if by_cfg.get(c)}
+        scores = {lr: v for lr, v in scores.items() if np.isfinite(v)}  # a diverged run never wins
         n = {lr: len(by_cfg.get(c, [])) for lr, c in sweep.items()}
         if scores:
             best = min(scores, key=scores.get)
