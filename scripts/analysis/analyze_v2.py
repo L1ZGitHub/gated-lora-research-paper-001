@@ -5,6 +5,8 @@ no GPU).
   q1:        pre-registered Q1 test (experiments/README.md, v3): per-seed macro test loss (last
              checkpoint), gated vs each plain LoRA, Welch t-test with Holm correction, 95% CIs;
              plus the robustness metric (loss / base-model loss, v3_base_reference.json)
+  capacity:  (v3small) pre-registered "capacity-bound at rank X" test: plain rank X vs the
+             Phase B' r16, Welch + Holm, and mean test loss above r16 by more than DELTA
 
   breakdown: per-task answer loss on val (in-distribution held-out) vs test (official splits),
              gated minus r66 / r56, mean over seeds: which tasks carry the val gain, and
@@ -54,9 +56,21 @@ VERSIONS = {  # version -> arm -> (config, seeds, expert ranks or None)
         "equal_rank": ("equal_rank", range(3), (19, 19, 18)),
         "frozen_gate": ("frozen_gate", range(3), (8, 16, 32)),
     },
+    "v3small": {  # Phase C': LR per arm from the 9-point small-rank grid; r16/r32 = Phase B' runs
+        "gated": ("gated_r2r4r8_lr1em4", SEEDS5, (2, 4, 8)),
+        "r14": ("baseline_r14_lr1em4", SEEDS5, None),
+        "r8": ("baseline_r8_lr1em4", SEEDS5, None),
+        "r4": ("baseline_r4_lr2p5em4", SEEDS5, None),
+        "r2": ("baseline_r2_lr2p5em4", SEEDS5, None),
+        "r16": ("baseline_r16_lr1em4", SEEDS5, None),
+        "r32": ("baseline_r32_lr5em5", SEEDS5, None),
+    },
 }
+SECONDARY = {"v3small": ("r16", "r32")}  # reported with CIs, outside the Holm family
+CAPACITY = {"v3small": ("r16", ("r14", "r8", "r4", "r2"))}  # reference arm, arms tested against it
 DELTA = 0.005  # Q1 equivalence margin (macro test loss, nats; README v3 amendment)
 P, ARMS = "v3_qwen25_05b_", VERSIONS["v3"]  # set by --version
+VERSION = "v3"
 GATES_DIR = None  # --gates-dir: re-dumped per-example files (knockout_v2.py --dump-dir)
 
 
@@ -91,15 +105,16 @@ def breakdown() -> dict:
                 for t, m in ev[key]["per_task"].items():
                     per.setdefault(arm, {}).setdefault(split, {}).setdefault(t, []).append(m["answer_loss"])
     tasks = sorted(per["gated"]["val"])
+    vs = [b for b in ARMS if ARMS[b][2] is None][:2]  # v3: r66, r56; v3small: r14, r8
     out = {"tasks": tasks, "mean": {}, "diff": {}}
     for arm in per:
         out["mean"][arm] = {sp: {t: float(np.mean(per[arm][sp][t])) for t in tasks} for sp in ("val", "test")}
     print("\n== Per-task answer loss: gated minus baseline (mean over seeds; negative = gated better)")
-    print(f"{'task':14s}" + "".join(f"{b + ' ' + sp:>14s}" for b in ("r66", "r56") for sp in ("val", "test"))
+    print(f"{'task':14s}" + "".join(f"{b + ' ' + sp:>14s}" for b in vs for sp in ("val", "test"))
           + f"{'gated val':>11s}{'gated test':>11s}{'seed sd test':>13s}")
     for t in tasks:
         row = []
-        for b in ("r66", "r56"):
+        for b in vs:
             for sp in ("val", "test"):
                 d = out["mean"]["gated"][sp][t] - out["mean"][b][sp][t]
                 out["diff"].setdefault(b, {}).setdefault(sp, {})[t] = d
@@ -107,7 +122,7 @@ def breakdown() -> dict:
         sd = float(np.std(per["gated"]["test"][t], ddof=1))
         print(f"{t:14s}" + "".join(f"{d:+14.4f}" for d in row)
               + f"{out['mean']['gated']['val'][t]:11.4f}{out['mean']['gated']['test'][t]:11.4f}{sd:13.4f}")
-    for b in ("r66", "r56"):
+    for b in vs:
         v, te = (np.mean(list(out["diff"][b][sp].values())) for sp in ("val", "test"))
         print(f"macro mean vs {b}: val {v:+.4f}  test {te:+.4f}")
     return out
@@ -131,7 +146,8 @@ def q1(base_ref: str | None) -> dict:
 
     per = {arm: [json.load(open(get(f"{cfg}_seed{s}", "eval_results.json")))["final"]["per_task"]
                  for s in seeds] for arm, (cfg, seeds, _) in ARMS.items()}
-    others = [b for b in ("r66", "r56", "r32", "r16") if b in per]
+    secondary = [b for b in per if b in SECONDARY.get(VERSION, ())]
+    others = [b for b in per if ARMS[b][2] is None and b not in secondary]
     tasks = sorted(per["gated"][0])
     print("\n== Per-task test answer loss (last checkpoint), mean +- sd over seeds")
     print(f"{'arm':12s}" + "".join(f"{t[:11]:>16s}" for t in tasks))
@@ -150,7 +166,7 @@ def q1(base_ref: str | None) -> dict:
                  for a, rows in per.items()}
         g = macro["gated"]
         res = {}
-        for b in others:
+        for b in others + secondary:
             x = macro[b]
             d = g.mean() - x.mean()
             vg, vx = g.var(ddof=1) / len(g), x.var(ddof=1) / len(x)
@@ -166,10 +182,13 @@ def q1(base_ref: str | None) -> dict:
                       "p": float(stats.ttest_ind(g, x, equal_var=False).pvalue),
                       "p_tost": float(p_tost),
                       "mean": float(x.mean()), "sd": float(x.std(ddof=1)), "n": len(x)}
-        p_holm = holm({b: res[b]["p"] for b in res})
-        p_tost_holm = (holm({b: res[b]["p_tost"] for b in res}) if metric == "raw"
-                       else {b: float("nan") for b in res})
-        for b in res:
+        p_holm = holm({b: res[b]["p"] for b in others})
+        p_tost_holm = (holm({b: res[b]["p_tost"] for b in others}) if metric == "raw"
+                       else {b: float("nan") for b in others})
+        for b in secondary:  # pre-registered as CIs only: no test, no verdict
+            res[b]["p_holm"] = res[b]["p_tost_holm"] = float("nan")
+            res[b]["verdict"] = "secondary (CI only)"
+        for b in others:
             res[b]["p_holm"], res[b]["p_tost_holm"] = p_holm[b], p_tost_holm[b]
             sup = ("gated better" if p_holm[b] < 0.05 and res[b]["diff"] < 0 else
                    "gated worse" if p_holm[b] < 0.05 else "")
@@ -184,12 +203,39 @@ def q1(base_ref: str | None) -> dict:
               f"macro test loss, gated {g.mean():.4f} +- {g.std(ddof=1):.4f} (n={len(g)})")
         print(f"  {'vs':5s} {'mean':>8s} {'sd':>7s} {'gated-x':>9s} {'95% CI (unadj.)':>21s} "
               f"{'p':>6s} {'p_holm':>6s} {'90% CI':>21s} {'p_TOST':>6s} {'holm':>6s}  verdict")
-        for b in others:
+        for b in others + secondary:
             r = res[b]
             print(f"  {b:5s} {r['mean']:8.4f} {r['sd']:7.4f} {r['diff']:+9.4f} "
                   f"[{r['ci95'][0]:+.4f}, {r['ci95'][1]:+.4f}] {r['p']:6.3f} {r['p_holm']:6.3f} "
                   f"[{r['ci90'][0]:+.4f}, {r['ci90'][1]:+.4f}] {r['p_tost']:6.3f} "
                   f"{r['p_tost_holm']:6.3f}  {r['verdict']}")
+    return out
+
+
+def capacity() -> dict:
+    """Pre-registered Phase C' test (README, 2026-10-11): plain rank X is "capacity-bound" if its
+    macro test loss differs from the reference arm (Welch, two-sided, Holm over the tested arms,
+    p < 0.05) and its mean exceeds the reference mean by more than DELTA."""
+    from scipy import stats
+
+    ref, arms = CAPACITY[VERSION]
+    macro = {a: np.array([json.load(open(get(f"{ARMS[a][0]}_seed{s}", "eval_results.json")))
+                          ["final"]["mean_task_answer_loss"] for s in ARMS[a][1]])
+             for a in (ref, *arms)}
+    r = macro[ref]
+    p_holm = holm({a: float(stats.ttest_ind(macro[a], r, equal_var=False).pvalue) for a in arms})
+    out = {"reference": ref, "reference_mean": float(r.mean()), "vs": {}}
+    print(f"\n== Capacity-bound test vs {ref} (macro test loss {r.mean():.4f} +- {r.std(ddof=1):.4f})")
+    print(f"  {'arm':5s} {'mean':>8s} {'sd':>7s} {'x-' + ref:>9s} {'p_holm':>7s}  capacity-bound")
+    for a in arms:
+        x = macro[a]
+        d = float(x.mean() - r.mean())
+        bound = bool(p_holm[a] < 0.05 and d > DELTA)
+        out["vs"][a] = {"mean": float(x.mean()), "sd": float(x.std(ddof=1)), "n": len(x),
+                        "diff": d, "p_holm": p_holm[a], "capacity_bound": bound}
+        print(f"  {a:5s} {x.mean():8.4f} {x.std(ddof=1):7.4f} {d:+9.4f} {p_holm[a]:7.3f}  {bound}")
+    if not any(v["capacity_bound"] for v in out["vs"].values()):
+        print("  no arm qualifies: the capacity-scarce regime was not reached")
     return out
 
 
@@ -322,7 +368,7 @@ def pertask(ko_dir: str) -> dict:
     import glob
     import os
     base = {}
-    for b, (cfg, seeds, _) in ((b, ARMS[b]) for b in ("r66", "r56", "r32", "r16") if b in ARMS):
+    for b, (cfg, seeds, _) in ((b, a) for b, a in ARMS.items() if a[2] is None):
         base[b] = np.mean([json.load(open(get(f"{cfg}_seed{x}", "eval_results.json")))["final"]
                            ["mean_task_answer_loss"] for x in seeds])
     out = {}
@@ -370,14 +416,17 @@ def main() -> None:
     ap.add_argument("--knockout", metavar="DIR", help="only the knockout faithfulness analysis")
     ap.add_argument("--pertask", metavar="DIR", help="only the per-task removal policy analysis")
     args = ap.parse_args()
-    global P, ARMS, GATES_DIR
-    P, ARMS = f"{args.version}_qwen25_05b_", VERSIONS[args.version]
+    global P, ARMS, GATES_DIR, VERSION
+    VERSION = args.version
+    P, ARMS = f"{args.version[:2]}_qwen25_05b_", VERSIONS[args.version]
     GATES_DIR = args.gates_dir
-    if args.base_ref is None and args.version == "v3":
+    if args.base_ref is None and args.version.startswith("v3"):
         args.base_ref = "experiments/v3_base_reference.json"
     args.out = args.out or f"analysis_{args.version}.json"
     if args.q1_only:
         res = {"q1": q1(args.base_ref)}
+        if VERSION in CAPACITY:
+            res["capacity"] = capacity()
     elif args.pertask:
         res = {"pertask": pertask(args.pertask)}
     elif args.knockout:
@@ -386,6 +435,8 @@ def main() -> None:
         res = {"routing": routing()}
     else:
         res = {"q1": q1(args.base_ref), "breakdown": breakdown(), "routing": routing()}
+        if VERSION in CAPACITY:
+            res["capacity"] = capacity()
     with open(args.out, "w") as f:
         json.dump(res, f, indent=1)
     print(f"\nsaved {args.out}")
