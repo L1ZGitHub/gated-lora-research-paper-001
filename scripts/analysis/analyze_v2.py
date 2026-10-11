@@ -174,7 +174,10 @@ def q1(base_ref: str | None) -> dict:
             sup = ("gated better" if p_holm[b] < 0.05 and res[b]["diff"] < 0 else
                    "gated worse" if p_holm[b] < 0.05 else "")
             eq = f"equivalent within {DELTA}" if p_tost_holm[b] < 0.05 else ""
-            res[b]["verdict"] = "; ".join(v for v in (sup, eq) if v) or "inconclusive"
+            # no equivalence test on the robustness metric: a non-significant difference there
+            # is "no detectable difference", not a failed equivalence
+            res[b]["verdict"] = ("; ".join(v for v in (sup, eq) if v)
+                                 or ("inconclusive" if metric == "raw" else "no detectable difference"))
         out[metric] = {"gated": {"mean": float(g.mean()), "sd": float(g.std(ddof=1)), "n": len(g)},
                        "vs": res, "per_seed": {a: v.tolist() for a, v in macro.items()}}
         print(f"\n== Q1 ({metric}{', primary' if metric == 'raw' else ', robustness'}): "

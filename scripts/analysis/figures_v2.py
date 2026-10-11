@@ -92,7 +92,9 @@ def fig1(out: Path) -> None:
                        "test": [e["final"]["mean_task_answer_loss"] for e in ev]}
     fig, axes = plt.subplots(1, 2, figsize=(6.9, 3.0), sharey=True)
     y = np.arange(len(arms))[::-1]
-    for ax, split, title in ((axes[0], "val", "Validation (held out from training data)"),
+    # v3: WikiText, CoNLL and XSum validate on their official validation split
+    val_title = "Validation (held out from training data)" if VERSION == "v2" else "Validation"
+    for ax, split, title in ((axes[0], "val", val_title),
                              (axes[1], "test", "Test (official splits)")):
         ref = np.mean(vals[arms[0][0]][split])
         ax.axvline(ref, color=BLUE, lw=0.8, ls=(0, (3, 3)), zorder=1)
