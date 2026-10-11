@@ -1,0 +1,11 @@
+# v3 Phase B' (experiments/README.md, v3 protocol). LR per arm = argmin of the 9-point Phase A'
+# grid (val macro, seed 0): gated 2.5e-5, r66 2.5e-5, r32 5e-5, r16 1e-4. Seed 0 = the Phase A' run.
+configs/experiments/v3/v3_qwen25_05b_gated_lr2p5em5.yaml 1 2 3 4
+configs/experiments/v3/v3_qwen25_05b_baseline_r66_lr2p5em5.yaml 1 2 3 4
+configs/experiments/v3/v3_qwen25_05b_baseline_r32_lr5em5.yaml 1 2 3 4
+configs/experiments/v3/v3_qwen25_05b_baseline_r16_lr1em4.yaml 1 2 3 4
+# Routing off (plain LoRA r=8+16+32) at gated's LR, 5 seeds
+configs/experiments/v3/v3_qwen25_05b_baseline_r56.yaml 0 1 2 3 4
+# Controls at gated's LR, 3 seeds (frozen gate: target top-1 0.723 = gated Phase A' seed 0)
+configs/experiments/v3/v3_qwen25_05b_frozen_gate.yaml 0 1 2
+configs/experiments/v3/v3_qwen25_05b_equal_rank.yaml 0 1 2

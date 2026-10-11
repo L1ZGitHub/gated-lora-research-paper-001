@@ -1,0 +1,25 @@
+# Control: FROZEN RANDOM gates (never trained), rescaled at init to a realistic sharpness.
+# Experts train under a fixed random routing. If quality, knockout faithfulness and maps match
+# the trained gate, learned routing buys nothing. frozen_gate_target_top1 = mean final top-1 of
+# the trained gate of v3 Phase A' at gated's LR (gated lr 2.5e-5, seed 0: 0.723). LR 2.5e-5.
+# Regularisers off: no gate grads.
+extends:
+  - models/qwen25_05b.yaml
+  - tasks/all_8.yaml
+  - base/v3.yaml
+
+experiment_name: v3_qwen25_05b_frozen_gate
+
+model:
+  freeze_gating: true
+  frozen_gate_target_top1: 0.723
+  use_load_balancing: false
+  use_l1_gate_regularization: false
+
+training:
+  learning_rate: 2.5e-5
+
+output:
+  output_dir: ./outputs/v3_qwen25_05b_frozen_gate
+  hf_dataset_repo: Helain/gated-lora-experiments
+  hf_dataset_path: v3/qwen25_05b_frozen_gate
