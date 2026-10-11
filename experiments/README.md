@@ -142,3 +142,37 @@ result is looked at).** From a code review of the pipeline:
   run; the achieved final top-1 of each frozen_gate run is reported next to it.
 - *Checkpoint selection* (secondary metric only) uses the first 250 val examples per task
   every 1000 steps, not the full val set.
+
+**Phase C' (pre-registered 2026-10-11, after the Phase B' results, before any Phase C' run):
+small ranks.** Phase B' found test loss flat from r16 to r66 and a router that puts 71% of its
+weight on the r32 expert: adapter capacity was not scarce, so gating had nothing to allocate.
+Phase C' repeats the comparison where capacity may be scarce. Same model, data, splits, steps
+and metric as above; only ranks and learning rates change.
+
+- *Arms.* Plain LoRA r2, r4, r8, r14 (alpha = 2r) and gated 2/4/8 (alphas 4/8/16, total rank
+  14, gate network unchanged). r14 is gated 2/4/8 with routing off. The gate network is ~5.5M
+  parameters (gated 8/16/32 36.3M vs r56 30.8M), so gated 2/4/8 has ~13.2M trainable parameters
+  against ~7.7M for r14; the equal-parameter references are the Phase B' arms r16 (8.8M, fewer)
+  and r32 (17.6M, more), no new arm. Exact counts are taken from the training logs.
+- *LR grid (seed 0, `queue_v3_phase_c_grid.txt`).* {1e-5, 2.5e-5, 5e-5, 1e-4, 2.5e-4, 5e-4, 1e-3,
+  2.5e-3, 5e-3} for every arm, shifted up from the Phase A' grid because the best LR rose as
+  the rank fell (r66 2.5e-5, r32 5e-5, r16 1e-4). Each arm's LR = argmin of its full-val macro
+  loss (last checkpoint); a run that diverges (non-finite loss) counts as worse than any finite
+  one. Every arm gets its own LR, r14 included. The grid is not extended: an argmin at an edge
+  is reported as such.
+- *Seeds.* Seeds 1-4 at each arm's LR (seed 0 = the grid run), 5 per arm.
+- *Is capacity scarce?* r2, r4, r8, r14 vs the Phase B' r16 runs: Welch, two-sided, Holm over
+  the 4 comparisons. "Capacity-bound at rank X" needs Holm-adjusted p < 0.05 AND a mean test
+  loss more than 0.005 above r16. If no rank qualifies, the regime was not reached and Phase C'
+  is reported as that, without reading the gated comparison as a test of gating under scarcity.
+- *Q1 (small).* Gated 2/4/8 vs r14, r8, r4, r2: the Q1 tests above (Welch + TOST with delta =
+  0.005, Holm over the 4 comparisons, same verdicts). Secondary, reported with CIs, not tested:
+  gated 2/4/8 vs r16 and r32 (equal-parameter references).
+- *Q2 (small).* The Q2 analyses above on gated 2/4/8 (gate shares per task and layer block,
+  eta^2, map reproducibility across seeds, expert knockout with usage-damage Spearman, removal
+  of the two smaller experts from all layers), set next to gated 8/16/32. No frozen-gate or
+  equal-rank control is trained for the small mix: its numbers are read against the Phase B'
+  controls, which is a limitation.
+- *Code.* Phase C' trains with the trainer of commit 00782ed; that fix changed the routing dump
+  only, not training, so Phase B' and Phase C' runs are comparable and Phase C' dumps need no
+  re-evaluation.
