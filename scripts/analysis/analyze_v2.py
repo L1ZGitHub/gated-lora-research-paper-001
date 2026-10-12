@@ -65,6 +65,13 @@ VERSIONS = {  # version -> arm -> (config, seeds, expert ranks or None)
         "r16": ("baseline_r16_lr1em4", SEEDS5, None),
         "r32": ("baseline_r32_lr5em5", SEEDS5, None),
     },
+    "v3smollm": {  # Phase D (SmolLM-360M): LR per arm from the 9-point Phase D grid
+        "gated": ("gated_lr2p5em4", SEEDS5, (8, 16, 32)),
+        "gated_small": ("gated_r2r4r8_lr5em4", SEEDS5, (2, 4, 8)),
+        "r56": ("baseline_r56_lr5em4", SEEDS5, None),
+        "r14": ("baseline_r14_lr1em3", SEEDS5, None),
+        "r2": ("baseline_r2_lr2p5em3", SEEDS5, None),
+    },
 }
 SECONDARY = {"v3small": ("r16", "r32")}  # reported with CIs, outside the Holm family
 CAPACITY = {"v3small": ("r16", ("r14", "r8", "r4", "r2")),  # reference arm, arms tested against it

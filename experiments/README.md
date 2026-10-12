@@ -243,3 +243,26 @@ batch, precision, gate network, auxiliary losses and metric; only the base model
     seeds with a mean <= -0.7 (Qwen: -0.90 to -0.95). No prediction for 8/16/32.
   - R7 removable small expert: removing the smallest expert from all layers changes the macro
     test loss by less than 0.005 in absolute value, in both mixes.
+- *LR decision (2026-10-12, grid complete, 45 runs, none diverged).* Full-val macro loss, seed 0:
+
+  | LR | r2 | r14 | r56 | gated 2/4/8 | gated 8/16/32 |
+  |---|---|---|---|---|---|
+  | 5e-6 | 1.2867 | 1.0391 | 0.9804 | 1.0214 | 0.9707 |
+  | 1e-5 | 1.0745 | 0.9865 | 0.9365 | 0.9697 | 0.9226 |
+  | 2.5e-5 | 0.9945 | 0.9270 | 0.8890 | 0.9085 | 0.8761 |
+  | 5e-5 | 0.9476 | 0.8921 | 0.8637 | 0.8782 | 0.8524 |
+  | 1e-4 | 0.9076 | 0.8662 | 0.8449 | 0.8559 | 0.8357 |
+  | 2.5e-4 | 0.8723 | 0.8426 | 0.8214 | 0.8351 | **0.8143** |
+  | 5e-4 | 0.8558 | 0.8261 | **0.8198** | **0.8199** | 0.8180 |
+  | 1e-3 | 0.8432 | **0.8237** | 0.8375 | 0.8249 | 0.8241 |
+  | 2.5e-3 | **0.8388** | 0.8489 | 0.9672 | 0.8396 | 0.8772 |
+
+  Chosen: r2 2.5e-3, r14 1e-3, r56 5e-4, gated 2/4/8 5e-4, gated 8/16/32 2.5e-4. **The r2
+  argmin is at the upper edge of the grid**; as pre-registered the grid is not extended, so r2
+  may be under-tuned and any r2 deficit (criterion R2, and the gated 2/4/8 vs r2 comparison) is
+  an upper bound on the effect of rank. The other four optima are interior. Seeds 1-4:
+  `queue_v3_phase_d_seeds.txt`.
+- *Incident.* Four grid runs were first placed on turing-5 and failed at start-up with "CUDA
+  device busy or unavailable" before any training step; they were rerun on other nodes, nothing
+  else changed. A later probe found the same error on GPU 1 of turing-6 and of turing-7 with
+  the nodes otherwise idle, so it is a fault of specific GPUs; turing-5, 6 and 7 are excluded.

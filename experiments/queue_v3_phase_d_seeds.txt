@@ -1,0 +1,9 @@
+# v3 Phase D seeds (experiments/README.md), second base model SmolLM-360M. LR per arm = argmin
+# of the 9-point Phase D grid (val macro, seed 0): gated 8/16/32 2.5e-4, gated 2/4/8 5e-4,
+# r56 5e-4, r14 1e-3, r2 2.5e-3 (upper grid edge, not extended). Seed 0 = the grid run. Gated
+# first: its runs are the longest.
+configs/experiments/v3/v3_smollm360m_gated_lr2p5em4.yaml 1 2 3 4
+configs/experiments/v3/v3_smollm360m_gated_r2r4r8_lr5em4.yaml 1 2 3 4
+configs/experiments/v3/v3_smollm360m_baseline_r56_lr5em4.yaml 1 2 3 4
+configs/experiments/v3/v3_smollm360m_baseline_r14_lr1em3.yaml 1 2 3 4
+configs/experiments/v3/v3_smollm360m_baseline_r2_lr2p5em3.yaml 1 2 3 4
