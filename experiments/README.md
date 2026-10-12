@@ -266,3 +266,23 @@ batch, precision, gate network, auxiliary losses and metric; only the base model
   device busy or unavailable" before any training step; they were rerun on other nodes, nothing
   else changed. A later probe found the same error on GPU 1 of turing-6 and of turing-7 with
   the nodes otherwise idle, so it is a fault of specific GPUs; turing-5, 6 and 7 are excluded.
+- *Status (2026-10-12, 09:15): Phase D interrupted, incomplete.* At 09:05 the cluster
+  administrators cancelled every job, and the account's access to the platform was then
+  withdrawn. No Phase D test or replication verdict has been computed.
+  - Complete on the Hub (15 seed runs + 45 grid runs): gated 8/16/32, gated 2/4/8 and r56 with
+    seeds 0-4; r14 with seeds 0-3; r2 with seed 0.
+  - Interrupted, resumable from `latest/` on the Hub: `baseline_r14_lr1em3_seed4` (step 1946 of
+    5000) and `baseline_r2_lr2p5em3_seed{1,2,3,4}` (steps 1985, 2035, 1980, 1760).
+  - Not run: knockouts and per-task removal for seeds 1-4 (seed 0 done; its outputs, the
+    routing analysis below and the grid summary are on the cluster, not in this repository;
+    all can be regenerated from the Hub).
+  - Routing analysis (`analyze_v2.py --version v3smollm --routing-only`, five seeds per gated
+    model, final for these quantities): gate shares small/middle/large expert 0.04/0.05/0.91
+    (8/16/32) and 0.03/0.07/0.90 (2/4/8); seed-to-seed correlation of task-centred maps 0.80
+    (min 0.62) and 0.56 (min 0.44), so R5 holds; Spearman(task loss, expected rank) for 2/4/8
+    -0.90, -0.95, -0.90, -0.90, -0.95, so R6 holds (8/16/32: -0.74 to -0.93); eta^2
+    early/mid/late 0.50/0.66/0.69 and 0.47/0.64/0.55; depth-profile reproducibility 1.00 and
+    0.95; Spearman(largest-expert share, relative loss reduction) +0.67 to +0.88 and +0.86 to
+    +0.95. Not replicated, although not a criterion: the more even spread of the Qwen 2/4/8
+    router (0.45 on its largest expert).
+  - R1-R4 and R7 remain open: they need the five interrupted runs and the knockouts.

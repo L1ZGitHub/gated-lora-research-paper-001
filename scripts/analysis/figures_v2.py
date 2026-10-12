@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Paper figures for the v2 or v3 Qwen2.5-0.5B experiments (--version; PDF + PNG), from the small
-HF result files and the knockout outputs of knockout_v2.py. Light mode only (print). Colours:
+"""Paper figures for the v2 or v3 experiments (--version; Qwen2.5-0.5B, or SmolLM-360M for
+v3smollm*; PDF + PNG), from the small HF result files and the knockout outputs of
+knockout_v2.py. Light mode only (print). Colours:
 the dataviz reference palette (categorical slot 1 blue for the gated arm, a neutral for context
 arms; sequential blue ramp; diverging blue <-> red around a gray midpoint).
 
@@ -60,6 +61,18 @@ FIG1_ARMS = {  # version -> [(label, config, seeds, emphasised)]; the first entr
         ("LoRA r16", "baseline_r16_lr1em4", range(5), False),
         ("LoRA r32", "baseline_r32_lr5em5", range(5), False),
     ],
+    "v3smollm": [  # Phase D: SmolLM-360M, both gated models and their plain twins
+        ("Gated 8/16/32", "gated_lr2p5em4", range(5), True),
+        ("LoRA r56 (= routing off)", "baseline_r56_lr5em4", range(5), False),
+        ("Gated 2/4/8", "gated_r2r4r8_lr5em4", range(5), False),
+        ("LoRA r14 (= 2/4/8, routing off)", "baseline_r14_lr1em3", range(5), False),
+        ("LoRA r2", "baseline_r2_lr2p5em3", range(5), False),
+    ],
+    "v3smollm_small": [  # same runs, gated 2/4/8 first (fig2 / fig3 of the small mix)
+        ("Gated 2/4/8", "gated_r2r4r8_lr5em4", range(5), True),
+        ("LoRA r14 (= routing off)", "baseline_r14_lr1em3", range(5), False),
+        ("LoRA r2", "baseline_r2_lr2p5em3", range(5), False),
+    ],
 }
 RANKS = {"v3small": (2, 4, 8), "v3smollm_small": (2, 4, 8)}  # gated arm (default 8/16/32)
 SUFFIX = {"v3small": "_small", "v3smollm": "_smollm", "v3smollm_small": "_smollm_small"}
@@ -68,7 +81,11 @@ FIG1_NOTE = {"v2": "LR 5e-5 for every arm.",
              "v3": "LR per arm from the Phase A' grid (gated, r66, r56 and controls 2.5e-5; "
                    "r32 5e-5; r16 1e-4).",
              "v3small": "LR per arm from the Phase C' grid (gated, r14, r8, r16 1e-4; r4, r2 "
-                        "2.5e-4; r32 5e-5)."}
+                        "2.5e-4; r32 5e-5).",
+             "v3smollm": "SmolLM-360M. LR per arm from the Phase D grid (gated 8/16/32 2.5e-4; gated 2/4/8, "
+                         "r56 5e-4; r14 1e-3; r2 2.5e-3).",
+             "v3smollm_small": "SmolLM-360M. LR per arm from the Phase D grid (gated 8/16/32 2.5e-4; gated 2/4/8, "
+                         "r56 5e-4; r14 1e-3; r2 2.5e-3)."}
 VERSION = "v2"
 GATES_DIR = None  # --gates-dir: re-dumped per-example files (knockout_v2.py --dump-dir)
 INK, INK2, GRID, SURF = "#0b0b0b", "#52514e", "#e4e3df", "#ffffff"
