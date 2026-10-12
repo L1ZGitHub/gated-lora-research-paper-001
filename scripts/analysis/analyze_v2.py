@@ -72,6 +72,7 @@ CAPACITY = {"v3small": ("r16", ("r14", "r8", "r4", "r2")),  # reference arm, arm
 MODELS = {"v3smollm": "smollm360m"}  # version -> model tag of the run names (default qwen25_05b)
 # Q1 reference arm per plain arm when a version has two gated models (default: "gated")
 Q1_REF = {"v3smollm": {"r14": "gated_small", "r2": "gated_small"}}
+TWIN = {"gated": "r56", "gated_small": "r14"}  # Phase D: routing-off twin of each gated model
 DELTA = 0.005  # Q1 equivalence margin (macro test loss, nats; README v3 amendment)
 P, ARMS = "v3_qwen25_05b_", VERSIONS["v3"]  # set by --version
 VERSION = "v3"
@@ -432,6 +433,45 @@ def pertask(ko_dir: str) -> dict:
     return out
 
 
+def replication(analysis: str, ko: str) -> dict:
+    """Phase D verdicts R1-R7 exactly as pre-registered (experiments/README.md, 2026-10-12), from
+    the saved full analysis (q1, capacity, routing) and the saved knockout analysis."""
+    a, k = json.load(open(analysis)), json.load(open(ko))["knockout"]
+    mixes = {arm: v for arm, v in ARMS.items() if v[2] is not None}  # gated, gated_small
+    vs, out = a["q1"]["raw"]["vs"], {}
+
+    def cond(arm: str, name: str, key: str) -> list:
+        cfg, seeds, _ = ARMS[arm]
+        return [k[f"{cfg}_seed{s}"]["conditions"][name][key] for s in seeds]
+
+    out["R1"] = {"ok": all(vs[b]["p_tost_holm"] < 0.05 for b in TWIN.values()),
+                 "detail": {f"{g} vs {b}": vs[b]["p_tost_holm"] for g, b in TWIN.items()}}
+    out["R2"] = {"ok": not a["capacity"]["vs"]["r2"]["capacity_bound"],
+                 "detail": {x: a["capacity"]["vs"]["r2"][x] for x in ("diff", "p_holm")}}
+    r3, r4, r5, r7 = {}, {}, {}, {}
+    for arm, (_, _, ranks) in mixes.items():
+        big, small = int(np.argmax(ranks)), int(np.argmin(ranks))
+        dmg = {e: float(np.mean(cond(arm, f"ko{e}_all", "macro_damage"))) for e in range(len(ranks))}
+        r3[arm] = {"damage": dmg, "ok": bool(
+            dmg[big] >= 10 * max(abs(d) for e, d in dmg.items() if e != big))}
+        rho = [x for b in ("early", "mid", "late") for x in cond(arm, f"ko{big}_{b}", "rho_usage_damage")]
+        r4[arm] = {"mean": float(np.mean(rho)), "positive": int(np.sum(np.array(rho) > 0)),
+                   "n": len(rho), "ok": bool(np.mean(rho) > 0 and np.sum(np.array(rho) > 0) >= 12)}
+        rep = float(np.mean(a["routing"][arm]["map_seed_corr"]))
+        r5[arm] = {"mean": rep, "ok": rep >= 0.5}
+        r7[arm] = {"damage": dmg[small], "ok": abs(dmg[small]) < DELTA}
+    for name, r in (("R3", r3), ("R4", r4), ("R5", r5), ("R7", r7)):
+        out[name] = {"ok": all(v["ok"] for v in r.values()), "detail": r}
+    rho = a["routing"]["gated_small"]["rho_task_difficulty_vs_rank"]
+    out["R6"] = {"ok": bool(max(rho) < 0 and np.mean(rho) <= -0.7),
+                 "detail": {"per_seed": rho, "mean": float(np.mean(rho))}}
+    print("\n== Phase D replication criteria")
+    for name in sorted(out):
+        print(f"  {name}: {'replicated' if out[name]['ok'] else 'NOT replicated'}  "
+              f"{json.dumps(out[name]['detail'])}")
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", choices=sorted(VERSIONS), default="v3")
@@ -446,6 +486,8 @@ def main() -> None:
     ap.add_argument("--routing-only", action="store_true")
     ap.add_argument("--knockout", metavar="DIR", help="only the knockout faithfulness analysis")
     ap.add_argument("--pertask", metavar="DIR", help="only the per-task removal policy analysis")
+    ap.add_argument("--replication", nargs=2, metavar=("ANALYSIS", "KNOCKOUT"),
+                    help="only the Phase D verdicts R1-R7, from the two saved analysis files")
     args = ap.parse_args()
     global P, ARMS, GATES_DIR, VERSION
     VERSION = args.version
@@ -459,6 +501,8 @@ def main() -> None:
         res = {"q1": q1(args.base_ref)}
         if VERSION in CAPACITY:
             res["capacity"] = capacity()
+    elif args.replication:
+        res = {"replication": replication(*args.replication)}
     elif args.pertask:
         res = {"pertask": pertask(args.pertask)}
     elif args.knockout:

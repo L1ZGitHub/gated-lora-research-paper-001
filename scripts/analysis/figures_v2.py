@@ -61,8 +61,9 @@ FIG1_ARMS = {  # version -> [(label, config, seeds, emphasised)]; the first entr
         ("LoRA r32", "baseline_r32_lr5em5", range(5), False),
     ],
 }
-RANKS = {"v3small": (2, 4, 8)}  # expert ranks of the gated arm (default 8/16/32)
-SUFFIX = {"v3small": "_small"}  # figure file suffix
+RANKS = {"v3small": (2, 4, 8), "v3smollm_small": (2, 4, 8)}  # gated arm (default 8/16/32)
+SUFFIX = {"v3small": "_small", "v3smollm": "_smollm", "v3smollm_small": "_smollm_small"}
+MODELS = {"v3smollm": "smollm360m", "v3smollm_small": "smollm360m"}  # default qwen25_05b
 FIG1_NOTE = {"v2": "LR 5e-5 for every arm.",
              "v3": "LR per arm from the Phase A' grid (gated, r66, r56 and controls 2.5e-5; "
                    "r32 5e-5; r16 1e-4).",
@@ -158,7 +159,8 @@ def fig2(out: Path) -> None:
     for e, (ax, name) in enumerate(zip(axes, [f"rank-{r} expert" for r in ranks])):
         im = ax.imshow(m[:, :, e], cmap=cmap, vmin=0, vmax=1, aspect="auto", interpolation="nearest")
         ax.set_title(name, loc="left", pad=5)
-        ax.set_xticks([0, 6, 12, 18, 23])
+        n_layers = m.shape[1]
+        ax.set_xticks([0, n_layers // 4, n_layers // 2, 3 * n_layers // 4, n_layers - 1])
         ax.set_xlabel("Layer")
         for s in ax.spines.values():
             s.set_visible(False)
@@ -203,7 +205,9 @@ def fig3(out: Path, ko_dir: str) -> None:
         ax.text(e * 4 + 1.5, -0.95, name, ha="center", va="bottom", color=INK, fontsize=8)
     ax.set_yticks(range(len(TASK_ORDER)))
     ax.set_yticklabels(TASK_ORDER)
-    ax.set_xlabel("Layers where the expert is removed (early 0-7, mid 8-15, late 16-23)")
+    n_layers = ko[0]["num_layers"]
+    ax.set_xlabel(f"Layers where the expert is removed (early 0-{n_layers // 3 - 1}, "
+                  f"mid {n_layers // 3}-{2 * n_layers // 3 - 1}, late {2 * n_layers // 3}-{n_layers - 1})")
     for s in ax.spines.values():
         s.set_visible(False)
     ax.tick_params(length=0)
@@ -220,7 +224,8 @@ def main() -> None:
     ap.add_argument("--out", default="figures")
     args = ap.parse_args()
     global VERSION, P, GATES_DIR
-    VERSION, P, GATES_DIR = args.version, f"{args.version[:2]}_qwen25_05b_", args.gates_dir
+    VERSION, GATES_DIR = args.version, args.gates_dir
+    P = f"{args.version[:2]}_{MODELS.get(args.version, 'qwen25_05b')}_"
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     fig1(out)
